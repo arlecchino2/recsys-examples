@@ -15,6 +15,11 @@
 import sys
 
 import torch
+import argparse
+from tqdm import tqdm
+import logging
+from datetime import datetime
+
 from configs import (
     InferenceEmbeddingConfig,
     RankingConfig,
@@ -23,16 +28,42 @@ from configs import (
 )
 from dataset.random_inference_dataset import RandomInferenceDataGenerator
 from dataset.utils import FeatureConfig
+from modules.gpu_memory_usage import print_gpu_memory_usage
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
+log_dir = "logs"
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 
-def run_ranking_gr_inference():
+logging.basicConfig(
+    filename=log_file,
+    filemode='a',
+    format='%(asctime)s - %(message)s',
+    level=logging.INFO
+)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run inference benchmark with variable batch size")
+    parser.add_argument('--batch_size', type=int, default=8, choices=[1, 2, 4, 5, 6, 7, 8, 10, 12, 14, 16],
+                        help='Batch size for inference')
+    # parser.add_argument('--use_kvcache', action='store_true', default=False,
+    #                     help='Whether to use kv_cache')
+    parser.add_argument('--use_cudagraph', action='store_true', default=False,
+                        help='Whether to use cuDagraph')
+    parser.add_argument('--full_mode', action='store_true', default=False,
+                        help='Whether to run in full mode')
+
+    args = parser.parse_args()
+    return args
+
+def run_ranking_gr_inference(inference_batch_size=8, _use_cudagraph=False, _full_mode=True):
     max_batch_size = 16
-    max_seqlen = 4096
+    # max_seqlen = 4096
+    max_seqlen = 10240
     max_num_candidates = 256
-    max_incremental_seqlen = 128
+    max_incremental_seqlen = 256
 
     # context_emb_size = 1000
     item_fea_name, item_vocab_size = "item_feat", 10000
@@ -68,7 +99,8 @@ def run_ranking_gr_inference():
         dtype=inference_dtype,
     )
 
-    _blocks_in_primary_pool = 10240
+    # _blocks_in_primary_pool = 40960
+    _blocks_in_primary_pool = 20480
     _page_size = 32
     _offload_chunksize = 8192
     kv_cache_config = get_kvcache_config(
@@ -102,25 +134,38 @@ def run_ranking_gr_inference():
         prediction_head_arch=[[128, 10, 1] for _ in range(num_tasks)],
     )
 
+    logging.info("Configurations:")
+    logging.info(f"max_batch_size: {max_batch_size}, max_seqlen: {max_seqlen}, max_num_candidates: {max_num_candidates}")
+    logging.info(f"item_fea_name: {item_fea_name}, action_fea_name: {action_fea_name}")
+    logging.info(f"hidden_dim_size: {hidden_dim_size}, num_heads: {num_heads}, num_layers: {num_layers}")
+    logging.info(f"hstu_config: {hstu_config}, kv_cache_config: {kv_cache_config}")
+
+    print("before inference model:", end=' ')
+    print_gpu_memory_usage(0)
+    logging.info("before inference model:")
+    logging.info(print_gpu_memory_usage(0))
+
     with torch.inference_mode():
         model_predict = InferenceRankingGR(
             hstu_config=hstu_config,
             kvcache_config=kv_cache_config,
             task_config=task_config,
-            use_cudagraph=True,
+            use_cudagraph=_use_cudagraph,
             cudagraph_configs=hstu_cudagraph_configs,
         )
         model_predict.bfloat16()
         model_predict.eval()
+        print("after inference model:", end=' ')
+        print_gpu_memory_usage(0)
 
         data_generator = RandomInferenceDataGenerator(
             feature_configs=feature_configs,
             item_feature_name=item_fea_name,
             contextual_feature_names=[],
             action_feature_name=action_fea_name,
-            max_num_users=16,
+            max_num_users=1024,
             max_batch_size=8,  # test batch size
-            max_seqlen=2304,
+            max_seqlen=8448,
             max_num_candidates=max_num_candidates,
             max_incremental_seqlen=max_incremental_seqlen,
             full_mode=True,
@@ -129,6 +174,11 @@ def run_ranking_gr_inference():
         num_warmup_batches = 16
         for idx in range(num_warmup_batches):
             uids = data_generator.get_inference_batch_user_ids()
+            print(f'idx:{idx}, uids:{uids}')
+            print_gpu_memory_usage(0)
+            logging.info("after inference model:")
+            logging.info(print_gpu_memory_usage(0))
+
 
             if uids is None:
                 break
@@ -139,11 +189,15 @@ def run_ranking_gr_inference():
 
             model_predict.forward(batch, uids, truncate_start_pos)
 
-        num_test_batches = 16
+        num_test_batches = 8192
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         predict_time = 0.0
         for idx in range(num_test_batches):
             uids = data_generator.get_inference_batch_user_ids()
+            print(f'idx:{idx}, uids:{uids}')
+            print_gpu_memory_usage(0)
+            logging.info(f'idx:{idx}, uids:{uids}')
+            logging.info(print_gpu_memory_usage(0))
 
             if uids is None:
                 break
@@ -159,7 +213,14 @@ def run_ranking_gr_inference():
             torch.cuda.synchronize()
             predict_time += ts_start.elapsed_time(ts_end)
         print("Total time(ms):", predict_time)
+        logging.info(f"Total time(ms): {predict_time}")
 
 
 if __name__ == "__main__":
     run_ranking_gr_inference()
+    args = parse_args()
+    run_ranking_gr_inference(
+        inference_batch_size=args.batch_size,
+        _use_cudagraph=args.use_cudagraph,
+        _full_mode=args.full_mode,
+    )

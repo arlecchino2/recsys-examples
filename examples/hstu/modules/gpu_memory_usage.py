@@ -21,7 +21,7 @@ def print_gpu_memory_usage(gpu_index=0):
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
 
         # 打印显存占用情况在一行
-        print(f"GPU {gpu_index} ({gpu_name.decode('utf-8')}): Total={mem_info.total / 1024 ** 2:.2f} MB,"
+        print(f"GPU {gpu_index} ({gpu_name}): Total={mem_info.total / 1024 ** 2:.2f} MB,"
               f" Used={mem_info.used / 1024 ** 2:.2f} MB, Free={mem_info.free / 1024 ** 2:.2f} MB")
 
     except pynvml.NVMLError as error:
