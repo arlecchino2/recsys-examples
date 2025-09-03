@@ -81,33 +81,79 @@ class RandomInferenceDataGenerator:
         self._item_history: Dict[int, torch.Tensor] = dict()
         self._action_history: Dict[int, torch.Tensor] = dict()
 
+    # def get_inference_batch_user_ids(self) -> Optional[torch.Tensor]:
+    #     if self._full_mode:
+    #         batch_size = self._max_batch_size
+    #         user_ids = list(range(self._max_batch_size))
+    #     else:
+    #         batch_size = random.randint(1, self._max_batch_size)
+    #         user_ids = torch.randint(self._max_num_users, (batch_size,)).tolist()
+    #         user_ids = list(set(user_ids))
+
+    #     user_ids = torch.tensor(
+    #         [
+    #             uid
+    #             for uid in user_ids
+    #             if uid not in self._item_history
+    #             or len(self._item_history[uid]) < self._max_hist_len
+    #         ]
+    #     ).long()
+    #     # if self._full_mode and len(user_ids) == 0:
+    #     #     batch_size = self._max_batch_size
+    #     #     user_ids = list(
+    #     #         range(
+    #     #             self._max_batch_size,
+    #     #             min(self._max_batch_size * 2, self._max_num_users),
+    #     #         )
+    #     #     )
+    #     #     user_ids = torch.tensor(user_ids).long()
+    #     if self._full_mode and len(user_ids) == 0:
+    #         start_id = 0
+    #         while len(user_ids) == 0 and start_id < self._max_num_users:
+    #             end_id = min(start_id + self._max_batch_size, self._max_num_users)
+    #             user_ids = [
+    #                 uid
+    #                 for uid in range(start_id, end_id)
+    #                 if uid not in self._item_history
+    #                 or len(self._item_history[uid]) < self._max_hist_len
+    #             ]
+    #             start_id = end_id
+    #         user_ids = torch.tensor(user_ids).long()
+    #     return user_ids if len(user_ids) > 0 else None
+
+    # Testing for kvcache offload
     def get_inference_batch_user_ids(self) -> Optional[torch.Tensor]:
-        if self._full_mode:
-            batch_size = self._max_batch_size
-            user_ids = list(range(self._max_batch_size))
+        batch_size = self._max_batch_size
+
+        if not hasattr(self, "_current_user_id"):
+            self._current_user_id = 0
+            self._current_user_count = 0
+            self._user_40_repeat_count = 1  # 用于记录用户 40 的特殊处理次数
+            self._user_5_repeat_count = 1  # 用于记录用户 5 的特殊处理次数
+        
+        if 40 in range(self._current_user_id, self._current_user_id + batch_size):
+            if self._user_40_repeat_count < 8:
+                self._user_40_repeat_count += 1
+            else:
+                self._current_user_id += batch_size
+        elif 5 in range(self._current_user_id, self._current_user_id + batch_size):
+            if self._user_5_repeat_count < 2:
+                self._user_5_repeat_count += 1
+            else:
+                self._current_user_id += batch_size        
         else:
-            batch_size = random.randint(1, self._max_batch_size)
-            user_ids = torch.randint(self._max_num_users, (batch_size,)).tolist()
-            user_ids = list(set(user_ids))
+            if self._current_user_count < 32:
+                self._current_user_count += 1
+            else:
+                self._current_user_id += batch_size
+                self._current_user_count = 1
 
         user_ids = torch.tensor(
-            [
-                uid
-                for uid in user_ids
-                if uid not in self._item_history
-                or len(self._item_history[uid]) < self._max_hist_len
-            ]
+            [self._current_user_id + i for i in range(batch_size)]
         ).long()
-        if self._full_mode and len(user_ids) == 0:
-            batch_size = self._max_batch_size
-            user_ids = list(
-                range(
-                    self._max_batch_size,
-                    min(self._max_batch_size * 2, self._max_num_users),
-                )
-            )
-            user_ids = torch.tensor(user_ids).long()
-        return user_ids if len(user_ids) > 0 else None
+
+        return user_ids
+
 
     def get_random_inference_batch(
         self, user_ids, truncate_start_positions

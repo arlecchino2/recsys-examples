@@ -17,13 +17,21 @@ from typing import Tuple
 
 import flashinfer
 import paged_kvcache_ops
-import tensorrt_llm
+# import tensorrt_llm
+import sys
+sys.path.append('/workdir/test/tensorrt-llm-kvcache/cpp/build/tensorrt_llm/pybind')  # 确保模块路径在系统路径中
+import bindings
+
 import torch
 from configs import InferenceHSTUConfig, KVCacheConfig, KVCacheMetadata
 
-KVCacheManagerImpl = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
-KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
-DataType = tensorrt_llm.bindings.DataType
+# KVCacheManagerImpl = tensorrt_llm.bindings.internal.batch_manager.KVCacheManager
+# KvCacheConfigCpp = tensorrt_llm.bindings.KvCacheConfig
+# DataType = tensorrt_llm.bindings.DataType
+
+KVCacheManagerImpl = bindings.internal.batch_manager.KVCacheManager
+KvCacheConfigCpp = bindings.KvCacheConfig
+DataType = bindings.DataType
 
 
 class HSTUGpuKVCacheManager:
@@ -89,7 +97,8 @@ class HSTUGpuKVCacheManager:
             "max_sequence_length": self.max_seq_len,
             "enable_block_reuse": False,
             "onboard_blocks": True,
-            "cache_type": tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            # "cache_type": tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            "cache_type": bindings.internal.batch_manager.CacheType.SELF,
             "secondary_offload_min_priority": None,
             "event_manager": None,
             "enable_partial_reuse": True,
