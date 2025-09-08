@@ -19,7 +19,7 @@ import flashinfer
 import paged_kvcache_ops
 # import tensorrt_llm
 import sys
-sys.path.append('/workdir/test/tensorrt-llm-kvcache/cpp/build/tensorrt_llm/pybind')  # 确保模块路径在系统路径中
+sys.path.append('/workdir/test/tensorrt-llm-kvcache/cpp/build/tensorrt_llm/pybind')
 import bindings
 
 import torch
@@ -149,9 +149,45 @@ class HSTUGpuKVCacheManager:
             user_id = user_ids[idx].item()
             start_pos = user_start_pos[idx].item()
             new_history_length = new_history_lengths[idx].item()
+            # evicted_users = self.impl.get_evicted_request_ids_for_allocation(user_id, start_pos, new_history_length, 1)
             self.impl.add_sequence_with_eviction(
                 user_id, start_pos, new_history_length, 1, None
             )
+    
+    # ==== wx: allocate with eviction ====
+    def allocate_with_eviction_handling(
+        self,
+        user_ids: torch.Tensor,
+        user_start_pos: torch.Tensor,
+        new_history_lengths: torch.Tensor,
+        evicted_offload_callback=None,
+    ):
+        self._offload_end_event.wait()
+        batch_size = len(user_ids)
+        
+        for idx in range(batch_size):
+            user_id = user_ids[idx].item()
+            start_pos = user_start_pos[idx].item()
+            new_history_length = new_history_lengths[idx].item()
+            
+            # 1. 获取这个用户分配时将被驱逐的用户列表
+            evicted_users = self.impl.get_evicted_request_ids_for_allocation(
+                user_id, start_pos, new_history_length, 1
+            )
+            
+            # 2. 如果有被驱逐的用户，立即处理下沉
+            if evicted_users and evicted_offload_callback is not None:
+                evicted_user_tensor = torch.tensor(evicted_users, dtype=torch.long)
+                # 在驱逐前获取这些用户的metadata
+                evicted_metadata = self.get_cache_metadata(evicted_user_tensor)
+                # 立即执行驱逐下沉
+                evicted_offload_callback(evicted_user_tensor, evicted_metadata)
+            
+            # 3. 执行真正的分配（此时驱逐会发生，但KV缓存已经被下沉保存）
+            self.impl.add_sequence_with_eviction(
+                user_id, start_pos, new_history_length, 1, None
+            )
+
 
     def evict(self, user_ids: torch.Tensor):
         for idx in range(len(user_ids)):
@@ -206,6 +242,7 @@ class HSTUGpuKVCacheManager:
         host_start_pos: torch.Tensor,
         host_lengths: torch.Tensor,
         kvcache_metadata: KVCacheMetadata,
+        eviction_mode: bool = False, # support eviction mode
     ):
         batch_size = len(user_ids)
         pages_per_chunk = self.offload_chunksize // self.page_size
@@ -228,28 +265,54 @@ class HSTUGpuKVCacheManager:
             new_offload_length = max(
                 0, (cached_start_pos + cached_length) - new_offload_start_pos
             )
-            new_offload_chunks = new_offload_length // self.offload_chunksize
-            if new_offload_chunks == 0:
-                continue
-            new_offload_start_page_idx = (
-                kvcache_metadata.kv_indptr[idx]
-                + new_offload_start_pos // self.page_size
-            )
-            new_offload_end_page_idx = (
-                new_offload_start_page_idx + new_offload_chunks * pages_per_chunk
-            )
-            new_offload_length = new_offload_chunks * self.offload_chunksize
+            # When adding sequences, the kv cache manager evict the LRU sequence, offloading its corresponding pages.
+            if eviction_mode:
+                if new_offload_length == 0:
+                    continue
+                else:
+                    new_offload_start_page_idx = (
+                        kvcache_metadata.kv_indptr[idx]
+                        + new_offload_start_pos // self.page_size
+                    )
+                    new_offload_end_page_idx = (
+                        kvcache_metadata.kv_indptr[idx]
+                        + (new_offload_start_pos + new_offload_length + self.page_size - 1) // self.page_size
+                    )
+                    
+                    offload_page_ids = kvcache_metadata.kv_indices[
+                        new_offload_start_page_idx:new_offload_end_page_idx
+                    ]
+                    
+                    num_pages = len(offload_page_ids)
+                    if num_pages > 0:
+                        offload_user_ids.append(uid)
+                        offload_start_pos.append(new_offload_start_pos)
+                        page_ids_to_offload.append(offload_page_ids)
+                        offload_page_indptr.append(offload_page_indptr[-1] + num_pages)
+            # Offloading KV cache in a chunk-level granularity.
+            else:
+                new_offload_chunks = new_offload_length // self.offload_chunksize
+                if new_offload_chunks == 0:
+                    continue
+                new_offload_start_page_idx = (
+                    kvcache_metadata.kv_indptr[idx]
+                    + new_offload_start_pos // self.page_size
+                )
+                new_offload_end_page_idx = (
+                    new_offload_start_page_idx + new_offload_chunks * pages_per_chunk
+                )
+                new_offload_length = new_offload_chunks * self.offload_chunksize
 
-            offload_page_ids = kvcache_metadata.kv_indices[
-                new_offload_start_page_idx:new_offload_end_page_idx
-            ]
+                offload_page_ids = kvcache_metadata.kv_indices[
+                    new_offload_start_page_idx:new_offload_end_page_idx
+                ]
 
-            num_pages = len(offload_page_ids)
-            if num_pages > 0:
-                offload_user_ids.append(uid)
-                offload_start_pos.append(new_offload_start_pos)
-                page_ids_to_offload.append(offload_page_ids)
-                offload_page_indptr.append(offload_page_indptr[-1] + num_pages)
+                num_pages = len(offload_page_ids)
+                if num_pages > 0:
+                    offload_user_ids.append(uid)
+                    offload_start_pos.append(new_offload_start_pos)
+                    page_ids_to_offload.append(offload_page_ids)
+                    offload_page_indptr.append(offload_page_indptr[-1] + num_pages)
 
         offload_user_ids = torch.tensor(offload_user_ids).long()
         offload_start_pos = torch.tensor(offload_start_pos, dtype=torch.int32)

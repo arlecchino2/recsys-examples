@@ -246,6 +246,31 @@ class InferenceRankingGR(torch.nn.Module):
             torch.tensor(kvdata_lengths, dtype=torch.int32),
         )
 
+    # wx: Offload evicted users' KV cache to host storage which is not chunked
+    def _handle_evicted_users_offload(self, evicted_user_ids: torch.Tensor, evicted_metadata: KVCacheMetadata):
+        """处理被驱逐用户的KV缓存下沉"""
+        if len(evicted_user_ids) == 0 or evicted_metadata is None:
+            return
+        evicted_metadata.kv_cache_table = self._kvcache_metadata.kv_cache_table[:]
+        evicted_metadata.onload_history_kv_buffer = (
+            self._kvcache_metadata.onload_history_kv_buffer[:]
+        )
+        # 1. 记录当前流的事件，确保GPU计算完成
+        self._gpu_kv_cache_manager._offload_start_event.record(
+            torch.cuda.current_stream()
+        )
+        
+        # 2. 执行驱逐模式的异步下沉（直接使用现有函数）
+        offload_results = self.offload_kv_cache_async(
+            evicted_user_ids, 
+            evicted_metadata,
+            eviction_mode=True  # 驱逐模式：下沉所有未下沉内容
+        )
+        
+        # 3. 等待下沉完成
+        if offload_results is not None:
+            self.offload_kv_cache_wait(offload_results)
+
     def prepare_kv_cache(
         self, batch: Batch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
     ) -> KVCacheMetadata:
@@ -259,8 +284,15 @@ class InferenceRankingGR(torch.nn.Module):
             cached_lengths,
         ) = self._gpu_kv_cache_manager.get_batch_kvdata_info(user_ids)
 
-        self._gpu_kv_cache_manager.allocate(
-            user_ids, user_start_pos, new_history_lengths
+        # wx: Using new function to handle evicted users when allocating new requests
+        # self._gpu_kv_cache_manager.allocate(
+        #     user_ids, user_start_pos, new_history_lengths
+        # )
+        self._gpu_kv_cache_manager.allocate_with_eviction_handling(
+            user_ids, 
+            user_start_pos, 
+            new_history_lengths,
+            evicted_offload_callback=self._handle_evicted_users_offload
         )
         kv_cache_metadata = self._gpu_kv_cache_manager.get_cache_metadata(user_ids)
         append_metadata = self._gpu_kv_cache_manager.get_append_metadata(
@@ -349,7 +381,7 @@ class InferenceRankingGR(torch.nn.Module):
             self.offload_kv_cache_wait(offload_results)
 
     def offload_kv_cache_async(
-        self, user_ids: torch.Tensor, kvcache_metadata: KVCacheMetadata
+        self, user_ids: torch.Tensor, kvcache_metadata: KVCacheMetadata, eviction_mode: bool = False
     ):
         host_kvdata_start_pos, host_kvdata_lengths = zip(
             *[
@@ -361,7 +393,7 @@ class InferenceRankingGR(torch.nn.Module):
         host_kvdata_lengths = torch.tensor(host_kvdata_lengths, dtype=torch.int32)
 
         offload_results = self._gpu_kv_cache_manager.offload_async(
-            user_ids, host_kvdata_start_pos, host_kvdata_lengths, kvcache_metadata
+            user_ids, host_kvdata_start_pos, host_kvdata_lengths, kvcache_metadata, eviction_mode
         )
         return offload_results
 
@@ -428,7 +460,7 @@ class InferenceRankingGR(torch.nn.Module):
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._dense_module(jagged_data.values)
             self._offload_states = self.offload_kv_cache_async(
-                user_ids, kvcache_metadata
+                user_ids, kvcache_metadata, eviction_mode=False
             )
             self.offload_kv_cache_wait(self._offload_states)
             self.finalize_kv_cache(user_ids)

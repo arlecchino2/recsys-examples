@@ -65,8 +65,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run inference benchmark with variable batch size")
     parser.add_argument('--batch_size', type=int, default=8, choices=[1, 2, 4, 5, 6, 7, 8, 10, 12, 14, 16],
                         help='Batch size for inference')
-    # parser.add_argument('--use_kvcache', action='store_true', default=False,
-    #                     help='Whether to use kv_cache')
+    parser.add_argument('--use_kvcache', action='store_true', default=False,
+                        help='Whether to use kv_cache')
     parser.add_argument('--use_cudagraph', action='store_true', default=False,
                         help='Whether to use cuDagraph')
     parser.add_argument('--full_mode', action='store_true', default=False,
@@ -75,7 +75,7 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def run_ranking_gr_inference(inference_batch_size=8, _use_cudagraph=False, _full_mode=True):
+def run_ranking_gr_inference(inference_batch_size=8, _use_kvcache=True, _use_cudagraph=False, _full_mode=True):
     # print("Current working directory:", os.getcwd())
     max_batch_size = 16
     # max_seqlen = 4096
@@ -253,6 +253,7 @@ if __name__ == "__main__":
     args = parse_args()
     run_ranking_gr_inference(
         inference_batch_size=args.batch_size,
+        _use_kvcache=args.use_kvcache,
         _use_cudagraph=args.use_cudagraph,
         _full_mode=args.full_mode,
     )
