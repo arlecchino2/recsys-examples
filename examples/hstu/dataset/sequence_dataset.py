@@ -252,14 +252,14 @@ class SequenceDataset(IterableDataset[Batch]):
                         else action_seq
                     )
                     labels.extend(label)
-            if len(item_features_seqlen) < self._batch_size:
-                padded_size = self._batch_size - len(item_features_seqlen)
-                for name in self._contextual_feature_names:
-                    contextual_features_seqlen[name] += [0 for _ in range(padded_size)]
-                item_features_seqlen += [0 for _ in range(padded_size)]
-                action_features_seqlen += [0 for _ in range(padded_size)]
-                if self._max_num_candidates > 0:
-                    num_candidates += [0 for _ in range(padded_size)]
+            # if len(item_features_seqlen) < self._batch_size:
+            #     padded_size = self._batch_size - len(item_features_seqlen)
+            #     for name in self._contextual_feature_names:
+            #         contextual_features_seqlen[name] += [0 for _ in range(padded_size)]
+            #     item_features_seqlen += [0 for _ in range(padded_size)]
+            #     action_features_seqlen += [0 for _ in range(padded_size)]
+            #     if self._max_num_candidates > 0:
+            #         num_candidates += [0 for _ in range(padded_size)]
             feature_to_max_seqlen = {}
             for name in self._contextual_feature_names:
                 feature_to_max_seqlen[name] = max(contextual_features_seqlen[name])
@@ -296,7 +296,8 @@ class SequenceDataset(IterableDataset[Batch]):
             )
             batch_kwargs = dict(
                 features=features,
-                batch_size=self._batch_size,
+                # batch_size=self._batch_size,
+                batch_size = len(sample_ids),
                 feature_to_max_seqlen=feature_to_max_seqlen,
                 contextual_feature_names=self._contextual_feature_names,
                 item_feature_name=self._item_feature_name,

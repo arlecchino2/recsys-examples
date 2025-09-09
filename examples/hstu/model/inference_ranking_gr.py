@@ -392,6 +392,11 @@ class InferenceRankingGR(torch.nn.Module):
         self, batch: Batch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
     ) -> KVCacheMetadata:
         batch_size = user_ids.shape[0]
+        # new_history_lengths = (
+        #     torch.sum(batch.features.lengths().view(-1, batch.batch_size), 0).view(-1)
+        #     - batch.num_candidates
+        # )
+        # new_history_lengths = new_history_lengths[:batch_size]
         new_history_lengths = (
             torch.sum(batch.features.lengths().view(-1, batch_size), 0).view(-1)
             - batch.num_candidates

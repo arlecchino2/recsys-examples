@@ -12,6 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 import argparse
 import enum
 import math
@@ -43,6 +48,36 @@ from inference_ranking_gr import InferenceRankingGR
 sys.path.append("./training/")
 from gin_config_args import DatasetArgs, NetworkArgs
 
+import argparse
+from tqdm import tqdm
+import logging
+from datetime import datetime
+
+# Set cuda device
+torch.cuda.set_device(1)
+device_id = torch.cuda.current_device()
+print(f"Current device: cuda:{torch.cuda.current_device()}")
+
+
+log_dir = "logs"
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
+
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+logger.propagate = False
+
+file_handler = logging.FileHandler(log_file, mode='a', encoding=None, delay=False)
+file_handler.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(asctime)s - %(message)s')
+file_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
@@ -154,6 +189,7 @@ def get_inference_hstu_model(
     num_contextual_features,
     total_max_seqlen,
     checkpoint_dir,
+    use_cudagraph_flag = False
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -182,9 +218,10 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        "blocks_in_primary_pool": 512,
+        # "blocks_in_primary_pool": 512,
+        "blocks_in_primary_pool": 4096,
         "page_size": 32,
-        "offload_chunksize": 32,
+        "offload_chunksize": 128,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -209,7 +246,9 @@ def get_inference_hstu_model(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config,
         task_config=task_config,
-        use_cudagraph=True,
+        logger=logger,
+        # use_cudagraph=True,
+        use_cudagraph=use_cudagraph_flag,
         cudagraph_configs=hstu_cudagraph_configs,
     )
     if hstu_config.bf16:
@@ -347,7 +386,7 @@ def run_ranking_gr_simulate(
 
 
 def run_ranking_gr_evaluate(
-    checkpoint_dir: str, disable_contextual_features: bool = False
+    checkpoint_dir: str, use_cudagraph: bool = False, disable_contextual_features: bool = False
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -360,7 +399,8 @@ def run_ranking_gr_evaluate(
         else 0
     )
 
-    max_batch_size = 1
+    # max_batch_size = 1
+    max_batch_size = 4
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
@@ -385,6 +425,7 @@ def run_ranking_gr_evaluate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            use_cudagraph,
         )
 
         eval_module = get_multi_event_metric_module(
@@ -444,6 +485,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--disable_context", action="store_true")
+    parser.add_argument('--use_cudagraph', action='store_true', default=False, help='Whether to use cudagraph')
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -453,7 +495,7 @@ if __name__ == "__main__":
             print("disable_auc is ignored in Eval mode.")
         if args.disable_context:
             print("disable_context is ignored in Eval mode.")
-        run_ranking_gr_evaluate(checkpoint_dir=args.checkpoint_dir)
+        run_ranking_gr_evaluate(checkpoint_dir=args.checkpoint_dir, use_cudagraph=args.use_cudagraph)
     elif args.mode == RunningMode.SIMULATE:
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,
