@@ -14,7 +14,7 @@
 # limitations under the License.
 import sys
 import os
-
+os.environ['NUMEXPR_MAX_THREADS'] = '256'
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 import argparse
@@ -58,7 +58,7 @@ torch.cuda.set_device(1)
 device_id = torch.cuda.current_device()
 print(f"Current device: cuda:{torch.cuda.current_device()}")
 
-
+# Set logging information
 log_dir = "logs"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
@@ -221,7 +221,7 @@ def get_inference_hstu_model(
         # "blocks_in_primary_pool": 512,
         "blocks_in_primary_pool": 4096,
         "page_size": 32,
-        "offload_chunksize": 128,
+        "offload_chunksize": 32,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -277,7 +277,7 @@ def run_ranking_gr_simulate(
         else 0
     )
 
-    max_batch_size = 1
+    max_batch_size = 4
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
@@ -321,9 +321,37 @@ def run_ranking_gr_simulate(
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
+        count = 0
         while True:
             try:
+                count += 1
                 uids, dates, seq_endptrs = next(dataloader_iter)
+                print(f'{count}: {uids}')
+                first_occurrence = torch.zeros_like(uids, dtype=torch.bool)
+                seen_uids = set()
+
+                for i, uid in enumerate(uids):
+                    uid_item = uid.item()
+                    if uid_item not in seen_uids:
+                        first_occurrence[i] = True
+                        seen_uids.add(uid_item)
+
+                # 获取按原始顺序的唯一用户
+                unique_uids = uids[first_occurrence]
+
+                # 为每个唯一用户合并数据
+                merged_seq_endptrs = []
+                merged_dates = []
+
+                for uid in unique_uids:
+                    user_mask = (uids == uid)
+                    merged_seq_endptrs.append(torch.max(seq_endptrs[user_mask]))
+                    merged_dates.append(dates[user_mask][0])
+
+                # 更新数据
+                uids = unique_uids
+                dates = torch.stack(merged_dates)
+                seq_endptrs = torch.stack(merged_seq_endptrs)
                 if dates[0] != cur_date:
                     if cur_date is not None:
                         eval_metric_dict = eval_module.compute()

@@ -355,6 +355,7 @@ class InferenceRankingGR(torch.nn.Module):
         """处理被驱逐用户的KV缓存下沉"""
         if len(evicted_user_ids) == 0 or evicted_metadata is None:
             return
+        # torch.cuda.synchronize()
         evicted_metadata.kv_cache_table = self._kvcache_metadata.kv_cache_table[:]
         evicted_metadata.onload_history_kv_buffer = (
             self._kvcache_metadata.onload_history_kv_buffer[:]
@@ -372,8 +373,19 @@ class InferenceRankingGR(torch.nn.Module):
         )
         
         # 3. 等待下沉完成
-        if offload_results is not None:
-            self.offload_kv_cache_wait(offload_results)
+        self.offload_kv_cache_wait(offload_results)
+        
+        # 移除这两行，因为prepare_kv_cache已经同步了
+        # torch.cuda.current_stream().synchronize()
+        # self._gpu_kv_cache_manager._offload_start_event.record(torch.cuda.current_stream())
+    
+        # 执行驱逐模式的异步下沉
+        # offload_results = self.offload_kv_cache_async(
+        #     evicted_user_ids, 
+        #     evicted_metadata,
+        #     eviction_mode=True
+        # )
+        # self.offload_kv_cache_wait(offload_results)
 
     def strip_contextual_features(self, embeddings, batch, user_start_pos):
         if int(min(user_start_pos)) >= len(batch.contextual_feature_names):
@@ -391,6 +403,7 @@ class InferenceRankingGR(torch.nn.Module):
     def prepare_kv_cache(
         self, batch: Batch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
     ) -> KVCacheMetadata:
+        torch.cuda.synchronize()
         batch_size = user_ids.shape[0]
         # new_history_lengths = (
         #     torch.sum(batch.features.lengths().view(-1, batch.batch_size), 0).view(-1)
@@ -412,7 +425,7 @@ class InferenceRankingGR(torch.nn.Module):
         # )
         self._gpu_kv_cache_manager.allocate_with_eviction_handling(
             user_ids, 
-            user_start_pos, 
+            user_start_pos,
             new_history_lengths,
             evicted_offload_callback=self._handle_evicted_users_offload
         )
@@ -532,11 +545,20 @@ class InferenceRankingGR(torch.nn.Module):
             user_start_pos_cuda = user_start_pos.to(
                 device=torch.cuda.current_device(), non_blocking=True
             )
+            # print("Before prepare_kv_cache")
+            torch.cuda.synchronize()
+
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+
+            # print("After prepare_kv_cache")
+            torch.cuda.synchronize()
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos
             )
+
+            # print("After embedding lookup")
+            torch.cuda.synchronize()
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,

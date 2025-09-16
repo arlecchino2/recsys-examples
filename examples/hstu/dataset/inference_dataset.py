@@ -113,7 +113,7 @@ class InferenceDataset(IterableDataset[Batch]):
             )
 
         self._batch_logs_frame.sort_values(by=timestamp_names, inplace=True)
-        len(self._batch_logs_frame)
+        # len(self._batch_logs_frame)
 
         self._num_samples = len(self._batch_logs_frame)
         self._max_seqlen = max_seqlen
@@ -282,9 +282,28 @@ class InferenceDataset(IterableDataset[Batch]):
             ).view(-1)
         else:
             contextual_features_tensor = torch.empty((0,), dtype=torch.int64)
+            # contextual_features_lengths_tensor = torch.tensor(
+            #     [0 for name in self._contextual_feature_names]
+            # ).view(-1)
+            # Create zero lengths for each contextual feature per batch sample to maintain tensor shape consistency
             contextual_features_lengths_tensor = torch.tensor(
-                [0 for name in self._contextual_feature_names]
+                [0 for _ in range(len(user_ids) * len(self._contextual_feature_names))]
             ).view(-1)
+            # features = KeyedJaggedTensor.from_lengths_sync(
+            #     keys=[self._item_feature_name, self._action_feature_name],
+            #     values=torch.concat(
+            #         [
+            #             torch.tensor(item_features, device=self._device),
+            #             torch.tensor(action_features, device=self._device),
+            #         ]
+            #     ).long(),
+            #     lengths=torch.concat(
+            #         [
+            #             torch.tensor(item_features_seqlen, device=self._device),
+            #             torch.tensor(action_features_seqlen, device=self._device),
+            #         ]
+            #     ).long(),
+            # )
         features = KeyedJaggedTensor.from_lengths_sync(
             keys=self._contextual_feature_names
             + [self._item_feature_name, self._action_feature_name],
@@ -306,7 +325,8 @@ class InferenceDataset(IterableDataset[Batch]):
         labels = torch.tensor(labels, dtype=torch.int64, device=self._device)
         batch_kwargs = dict(
             features=features,
-            batch_size=self._batch_size,
+            # batch_size=self._batch_size,
+            batch_size=len(user_ids),
             feature_to_max_seqlen=feature_to_max_seqlen,
             contextual_feature_names=self._contextual_feature_names,
             item_feature_name=self._item_feature_name,
