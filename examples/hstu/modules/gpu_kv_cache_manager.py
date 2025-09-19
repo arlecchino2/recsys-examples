@@ -244,6 +244,49 @@ class HSTUGpuKVCacheManager:
                 offload_start_pos.append(new_offload_start_pos)
                 page_ids_to_offload.append(offload_page_ids)
                 offload_page_indptr.append(offload_page_indptr[-1] + num_pages)
+        # batch_size = len(user_ids)
+
+        # offload_user_ids = []
+        # offload_start_pos = []
+        # offload_page_indptr = [0]
+
+        # page_ids_to_offload = []
+        # for idx in range(batch_size):
+        #     uid = user_ids[idx].item()
+        #     cur_offloaded_start_pos, cur_offloaded_length = (
+        #         host_start_pos[idx],
+        #         host_lengths[idx],
+        #     )
+        #     cached_start_pos, cached_length = self.get_user_kvdata_info(uid)
+
+        #     new_offload_start_pos = cur_offloaded_start_pos + cur_offloaded_length
+
+        #     new_offload_length = max(
+        #         0, (cached_start_pos + cached_length) - new_offload_start_pos
+        #     )
+            
+        #     # 移除 chunk 逻辑，只要有新内容就下沉
+        #     if new_offload_length == 0:
+        #         continue
+                
+        #     new_offload_start_page_idx = (
+        #         kvcache_metadata.kv_indptr[idx]
+        #         + new_offload_start_pos // self.page_size
+        #     )
+        #     # 计算需要的页面数量（向上取整）
+        #     new_offload_num_pages = (new_offload_length + self.page_size - 1) // self.page_size
+        #     new_offload_end_page_idx = new_offload_start_page_idx + new_offload_num_pages
+
+        #     offload_page_ids = kvcache_metadata.kv_indices[
+        #         new_offload_start_page_idx:new_offload_end_page_idx
+        #     ]
+
+        #     num_pages = len(offload_page_ids)
+        #     if num_pages > 0:
+        #         offload_user_ids.append(uid)
+        #         offload_start_pos.append(new_offload_start_pos)
+        #         page_ids_to_offload.append(offload_page_ids)
+        #         offload_page_indptr.append(offload_page_indptr[-1] + num_pages)
 
         offload_user_ids = torch.tensor(offload_user_ids).long()
         offload_start_pos = torch.tensor(offload_start_pos, dtype=torch.int32)

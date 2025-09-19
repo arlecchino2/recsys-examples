@@ -16,6 +16,12 @@ import sys
 import os
 os.environ['NUMEXPR_MAX_THREADS'] = '256'
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+os.environ['PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT'] = '3'
+
+import argparse
+from tqdm import tqdm
+import logging
+from datetime import datetime
 
 import argparse
 import enum
@@ -48,6 +54,25 @@ from inference_ranking_gr import InferenceRankingGR
 sys.path.append("./training/")
 from gin_config_args import DatasetArgs, NetworkArgs
 
+log_dir = "logs_new"
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
+
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+logger.propagate = False
+
+file_handler = logging.FileHandler(log_file, mode='a', encoding=None, delay=False)
+file_handler.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(asctime)s - %(message)s')
+file_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
@@ -159,6 +184,7 @@ def get_inference_hstu_model(
     num_contextual_features,
     total_max_seqlen,
     checkpoint_dir,
+    use_cudagraph
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -187,12 +213,13 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        "blocks_in_primary_pool": 512,
+        "blocks_in_primary_pool": 9182,
         "page_size": 32,
         "offload_chunksize": 32,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
+    print(kvcache_args["offload_chunksize"])
     kv_cache_config = get_kvcache_config(**kvcache_args)
 
     ranking_args = RankingArgs()
@@ -214,14 +241,15 @@ def get_inference_hstu_model(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config,
         task_config=task_config,
-        use_cudagraph=True,
+        logger=logger,
+        use_cudagraph=use_cudagraph,
         cudagraph_configs=hstu_cudagraph_configs,
     )
     if hstu_config.bf16:
         model.bfloat16()
     elif hstu_config.fp16:
         model.half()
-    model.load_checkpoint(checkpoint_dir)
+    # model.load_checkpoint(checkpoint_dir)
     model.eval()
 
     return model
@@ -231,6 +259,9 @@ def run_ranking_gr_simulate(
     checkpoint_dir: str,
     check_auc: bool = False,
     disable_contextual_features: bool = False,
+    inference_batch_size: int = 1,
+    use_cudagraph: bool = False,
+    full_mode: bool = True,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -243,9 +274,10 @@ def run_ranking_gr_simulate(
         else 0
     )
 
-    max_batch_size = 1
+    max_batch_size = inference_batch_size
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
-    print("total_max_seqlen", total_max_seqlen)
+    # print("total_max_seqlen", total_max_seqlen)
+    logger.info(f"total_max_seqlen: {total_max_seqlen}")
 
     with torch.inference_mode():
         model = get_inference_hstu_model(
@@ -254,6 +286,7 @@ def run_ranking_gr_simulate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            use_cudagraph,
         )
 
         if check_auc:
@@ -287,9 +320,37 @@ def run_ranking_gr_simulate(
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
+        count = 0
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
+                count += 1
+                print(f'{count}: {uids}')
+                first_occurrence = torch.zeros_like(uids, dtype=torch.bool)
+                seen_uids = set()
+
+                for i, uid in enumerate(uids):
+                    uid_item = uid.item()
+                    if uid_item not in seen_uids:
+                        first_occurrence[i] = True
+                        seen_uids.add(uid_item)
+
+                # 获取按原始顺序的唯一用户
+                unique_uids = uids[first_occurrence]
+
+                # 为每个唯一用户合并数据
+                merged_seq_endptrs = []
+                merged_dates = []
+
+                for uid in unique_uids:
+                    user_mask = (uids == uid)
+                    merged_seq_endptrs.append(torch.max(seq_endptrs[user_mask]))
+                    merged_dates.append(dates[user_mask][0])
+
+                # 更新数据
+                uids = unique_uids
+                dates = torch.stack(merged_dates)
+                seq_endptrs = torch.stack(merged_seq_endptrs)
                 if dates[0] != cur_date:
                     if cur_date is not None:
                         eval_metric_dict = eval_module.compute()
@@ -449,9 +510,23 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--disable_context", action="store_true")
+    parser.add_argument('--batch_size', type=int, default=1, choices=[1, 2, 4, 5, 6, 7, 8, 10, 12, 14, 16],
+                        help='Batch size for inference')
+    parser.add_argument('--gpu', type=int, default=1,
+                        help='GPU id for inference')
+    parser.add_argument('--use_kvcache', action='store_true', default=False,
+                        help='Whether to use kv_cache')
+    parser.add_argument('--use_cudagraph', action='store_true', default=False,
+                        help='Whether to use cuDagraph')
+    parser.add_argument('--full_mode', action='store_true', default=False,
+                        help='Whether to run in full mode')
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
+
+    torch.cuda.set_device(args.gpu)
+    device_id = torch.cuda.current_device()
+    print(f"Current device: cuda:{torch.cuda.current_device()}")
 
     if args.mode == RunningMode.EVAL:
         if args.disable_auc:
@@ -464,4 +539,7 @@ if __name__ == "__main__":
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,
             disable_contextual_features=args.disable_context,
+            inference_batch_size=args.batch_size,
+            use_cudagraph=args.use_cudagraph,
+            full_mode=args.full_mode,
         )

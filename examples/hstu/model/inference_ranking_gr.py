@@ -118,6 +118,7 @@ class InferenceRankingGR(torch.nn.Module):
         hstu_config: InferenceHSTUConfig,
         kvcache_config: KVCacheConfig,
         task_config: RankingConfig,
+        logger,
         use_cudagraph=False,
         cudagraph_configs=None,
     ):
@@ -125,6 +126,7 @@ class InferenceRankingGR(torch.nn.Module):
         self._device = torch.cuda.current_device()
         self._hstu_config = hstu_config
         self._task_config = task_config
+        self.logger = logger
 
         self._embedding_dim = hstu_config.hidden_size
         for ebc_config in task_config.embedding_configs:
@@ -142,7 +144,8 @@ class InferenceRankingGR(torch.nn.Module):
         self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
         self._mlp = MLP(
             self._embedding_dim,
-            task_config.prediction_head_arch,
+            # task_config.prediction_head_arch[0],
+            task_config.prediction_head_arch, # For benchmark
             task_config.prediction_head_act_type,
             task_config.prediction_head_bias,
             device=self._device,
@@ -399,13 +402,25 @@ class InferenceRankingGR(torch.nn.Module):
             user_ids, cached_start_pos, cached_lengths
         )
         if onload_length > 0:
-            kv_page_ids = triton_concat_2D_jagged(
-                max_seq_len=onload_kv_page_indptr[-1] + kv_cache_metadata.kv_indptr[-1],
-                values_a=onload_kv_page_ids.view(-1, 1),
-                values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-                offsets_a=onload_kv_page_indptr.to(torch.int64),
-                offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
-            )
+            # 当kv缓存需要从gpu和cpu(可选)上共同构建时
+            if kv_cache_metadata.kv_indices.numel() > 0:
+                kv_page_ids = triton_concat_2D_jagged(
+                    max_seq_len=onload_kv_page_indptr[-1]
+                    + kv_cache_metadata.kv_indices[-1],
+                    values_a=onload_kv_page_ids.view(-1, 1),
+                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+                    offsets_a=onload_kv_page_indptr.to(torch.int64),
+                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+                )
+            # 当kv缓存只需要从cpu上构建时 kv_cache_metadata.kv_indices为空 故不可用索引访问
+            else:
+                kv_page_ids = triton_concat_2D_jagged(
+                    max_seq_len=onload_kv_page_indptr[-1],
+                    values_a=onload_kv_page_ids.view(-1, 1),
+                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+                    offsets_a=onload_kv_page_indptr.to(torch.int64),
+                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+                )
             kv_cache_metadata.kv_indices = kv_page_ids.view(-1)
             kv_cache_metadata.kv_indptr = (
                 onload_kv_page_indptr + kv_cache_metadata.kv_indptr
