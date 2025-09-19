@@ -325,7 +325,8 @@ def run_ranking_gr_simulate(
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
                 count += 1
-                print(f'{count}: {uids}')
+                # print(f'{count}: {uids}')
+                logger.info(f'{count}: {uids}')
                 first_occurrence = torch.zeros_like(uids, dtype=torch.bool)
                 seen_uids = set()
 
