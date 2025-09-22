@@ -213,9 +213,9 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        "blocks_in_primary_pool": 9182,
+        "blocks_in_primary_pool": 8192,
         "page_size": 32,
-        "offload_chunksize": 1024,
+        "offload_chunksize": 32,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -321,12 +321,13 @@ def run_ranking_gr_simulate(
         start_time = time.time()
         cur_date = None
         count = 0
+        # time_change = 0
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
                 count += 1
-                # print(f'{count}: {uids}')
-                logger.info(f'{count}: {uids}')
+                print(f'{count}: {uids}')
+                # logger.info(f'{count}: {uids}')
                 first_occurrence = torch.zeros_like(uids, dtype=torch.bool)
                 seen_uids = set()
 
@@ -352,6 +353,7 @@ def run_ranking_gr_simulate(
                 uids = unique_uids
                 dates = torch.stack(merged_dates)
                 seq_endptrs = torch.stack(merged_seq_endptrs)
+                logger.info(f'{count}: {uids}, {seq_endptrs}')
                 if dates[0] != cur_date:
                     if cur_date is not None:
                         eval_metric_dict = eval_module.compute()
@@ -363,6 +365,8 @@ def run_ranking_gr_simulate(
                         )
                     model.clear_kv_cache()
                     cur_date = dates[0]
+                    if cur_date == "20220409":
+                        break
                 cached_start_pos, cached_len = model.get_user_kvdata_info(
                     uids, dbg_print=True
                 )

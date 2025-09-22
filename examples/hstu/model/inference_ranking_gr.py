@@ -401,26 +401,37 @@ class InferenceRankingGR(torch.nn.Module):
         ) = self._host_kv_storage_manager.lookup_kvdata(
             user_ids, cached_start_pos, cached_lengths
         )
+        # onload_kv_page_ids kv_cache_metadata.kv_indices
+        # self.logger.info(f"====== Preparing kv cache ======")
+        # self.logger.info(f"onload_kv_page_ids: {onload_kv_page_ids}")
+        # self.logger.info(f"kv_cache_metadata.kv_indices: {kv_cache_metadata.kv_indices}")
         if onload_length > 0:
             # 当kv缓存需要从gpu和cpu(可选)上共同构建时
-            if kv_cache_metadata.kv_indices.numel() > 0:
-                kv_page_ids = triton_concat_2D_jagged(
-                    max_seq_len=onload_kv_page_indptr[-1]
-                    + kv_cache_metadata.kv_indices[-1],
-                    values_a=onload_kv_page_ids.view(-1, 1),
-                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-                    offsets_a=onload_kv_page_indptr.to(torch.int64),
-                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
-                )
+            # if kv_cache_metadata.kv_indices.numel() > 0:
+                # kv_page_ids = triton_concat_2D_jagged(
+                #     max_seq_len=onload_kv_page_indptr[-1]
+                #     + kv_cache_metadata.kv_indptr[-1],
+                #     values_a=onload_kv_page_ids.view(-1, 1),
+                #     values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+                #     offsets_a=onload_kv_page_indptr.to(torch.int64),
+                #     offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+                # )
+            kv_page_ids = triton_concat_2D_jagged(
+                max_seq_len=onload_kv_page_indptr[-1] + kv_cache_metadata.kv_indptr[-1],
+                values_a=onload_kv_page_ids.view(-1, 1),
+                values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+                offsets_a=onload_kv_page_indptr.to(torch.int64),
+                offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+            )
             # 当kv缓存只需要从cpu上构建时 kv_cache_metadata.kv_indices为空 故不可用索引访问
-            else:
-                kv_page_ids = triton_concat_2D_jagged(
-                    max_seq_len=onload_kv_page_indptr[-1],
-                    values_a=onload_kv_page_ids.view(-1, 1),
-                    values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-                    offsets_a=onload_kv_page_indptr.to(torch.int64),
-                    offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
-                )
+            # else:
+            #     kv_page_ids = triton_concat_2D_jagged(
+            #         max_seq_len=onload_kv_page_indptr[-1],
+            #         values_a=onload_kv_page_ids.view(-1, 1),
+            #         values_b=kv_cache_metadata.kv_indices.view(-1, 1),
+            #         offsets_a=onload_kv_page_indptr.to(torch.int64),
+            #         offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
+            #     )
             kv_cache_metadata.kv_indices = kv_page_ids.view(-1)
             kv_cache_metadata.kv_indptr = (
                 onload_kv_page_indptr + kv_cache_metadata.kv_indptr
@@ -434,7 +445,7 @@ class InferenceRankingGR(torch.nn.Module):
         # cudagraph preparation
         if self.use_cudagraph:
             copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
-        # assert max(kv_cache_metadata.kv_indices.tolist()) < self._kvcache_metadata.kv_cache_table[0].shape[0]
+        assert max(kv_cache_metadata.kv_indices.tolist()) < self._kvcache_metadata.kv_cache_table[0].shape[0]
 
         return kv_cache_metadata
 
@@ -490,6 +501,11 @@ class InferenceRankingGR(torch.nn.Module):
                 device=torch.cuda.current_device(), non_blocking=True
             )
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
+            self.logger.info(f"====== After preparing kv cache ======")
+            self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
+            self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
+            self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos
@@ -499,6 +515,10 @@ class InferenceRankingGR(torch.nn.Module):
                 batch=batch,
                 seq_start_position=user_start_pos_cuda,
             )
+            self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
+            self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
+            self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
+            self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
 
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
