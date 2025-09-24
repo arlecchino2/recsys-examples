@@ -143,7 +143,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             requires_grad=False,
         )
 
-    def layer_output(num_tokens):
+    def layer_output(self, num_tokens):
         return self.output_buffer_[:num_tokens, ...]
 
     def load_variable(
@@ -220,6 +220,93 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
             seq_offsets_t=jd.num_candidates_offsets,
+        )
+
+        jagged_attn_output = jagged_attn_output.view(
+            -1, self._num_heads * self._linear_dim_per_head
+        )
+        parallel_input = user * F.layer_norm(
+            jagged_attn_output,
+            normalized_shape=[self._num_heads * self._linear_dim_per_head],
+            weight=self._output_layernorm_weight,
+            bias=self._output_layernorm_bias,
+            eps=self._eps,
+        )
+
+        layer_output = self._linear_proj(parallel_input)
+        if self._residual:
+            torch.add(layer_output, layer_input, out=layer_output)
+
+        return layer_output
+    
+    @torch.inference_mode()
+    def forward_no_cache_naive(
+        self,
+        # batch_size: int,
+        # num_tokens: int,
+        layer_input: torch.Tensor,
+        jd: JaggedData,
+    ) -> JaggedData:
+        normed_input = F.layer_norm(
+            layer_input,
+            normalized_shape=[self._embedding_dim],
+            weight=self._input_layernorm_weight,
+            bias=self._input_layernorm_bias,
+            eps=self._eps,
+        )
+
+        mixed_uvqk = F.silu(self._linear_uvqk(normed_input))
+        (user, value, query, key) = torch.split(
+            mixed_uvqk,
+            self._split_arg_list,
+            dim=-1,
+        )
+
+        value = value.view(-1, self._num_heads, self._linear_dim_per_head)
+        query = query.view(-1, self._num_heads, self._attention_dim_per_head)
+        key = key.view(-1, self._num_heads, self._attention_dim_per_head)
+
+        # kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
+        # (paged_k_cache, paged_v_cache) = kv_cache_table.unbind(dim=1)
+        # paged_kvcache_ops.append_kvcache(
+        #     key,
+        #     value,
+        #     kv_cache_metadata.batch_indices,
+        #     kv_cache_metadata.position,
+        #     jd.num_candidates_offsets,
+        #     kv_cache_metadata.new_history_nnz_cuda,
+        #     num_tokens,  # kv_cache_metadata.new_history_nnz
+        #     paged_k_cache,
+        #     paged_v_cache,
+        #     kv_cache_metadata.kv_indices,
+        #     kv_cache_metadata.kv_indptr,
+        #     kv_cache_metadata.kv_last_page_len,
+        #     0,  # NHD layout
+        # )
+
+        # kv_cache_metadata.onload_history_kv_events[self.layer_idx].wait(
+        #     torch.cuda.current_stream()
+        # )
+        jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
+            query,
+            key,
+            value,
+            jd.seqlen_offsets,
+            jd.seqlen_offsets, #kv_cache_metadata.total_history_offsets[: batch_size + 1],
+            self._max_seqlen,
+            self._max_seqlen,
+            num_contexts=jd.contextual_seqlen,
+            num_targets=jd.num_candidates,
+            target_group_size=1,
+            window_size=(-1, 0),
+            alpha=self._alpha,
+            rab=None,
+            has_drab=False,
+            # kv_cache=kv_cache_table,
+            # page_offsets=kv_cache_metadata.kv_indptr,
+            # page_ids=kv_cache_metadata.kv_indices,
+            # last_page_lens=kv_cache_metadata.kv_last_page_len,
+            # seq_offsets_t=jd.num_candidates_offsets,
         )
 
         jagged_attn_output = jagged_attn_output.view(

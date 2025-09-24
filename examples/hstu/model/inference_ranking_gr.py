@@ -502,10 +502,10 @@ class InferenceRankingGR(torch.nn.Module):
             )
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
             # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
-            self.logger.info(f"====== After preparing kv cache ======")
-            self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
-            self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
-            self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
+            # self.logger.info(f"====== After preparing kv cache ======")
+            # self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
+            # self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
+            # self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos
@@ -515,10 +515,10 @@ class InferenceRankingGR(torch.nn.Module):
                 batch=batch,
                 seq_start_position=user_start_pos_cuda,
             )
-            self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
-            self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
-            self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
-            self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
+            # self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
+            # self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
+            # self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
+            # self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
 
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
@@ -564,5 +564,83 @@ class InferenceRankingGR(torch.nn.Module):
             )
             self.offload_kv_cache_wait(self._offload_states)
             self.finalize_kv_cache(user_ids)
+
+        return jagged_item_logit
+    
+    def forward_no_cache(
+        self,
+        batch: Batch,
+        user_ids: torch.Tensor,
+        user_start_pos: torch.Tensor,
+    ):
+        with torch.inference_mode():
+            user_start_pos_cuda = user_start_pos.to(
+                device=torch.cuda.current_device(), non_blocking=True
+            )
+            # kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            # # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
+            # self.logger.info(f"====== After preparing kv cache ======")
+            # self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
+            # self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
+            # self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
+            embeddings = self._embedding_collection(batch.features)
+            embeddings, batch = self.strip_contextual_features(
+                embeddings, batch, user_start_pos
+            )
+            jagged_data = self._hstu_block._preprocessor(
+                embeddings=embeddings,
+                batch=batch,
+                seq_start_position=user_start_pos_cuda,
+            )
+            # self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
+            # self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
+            # self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
+            # self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
+
+            num_tokens = batch.features.values().shape[0]
+            if self.use_cudagraph:
+                self._hidden_states[:num_tokens, ...].copy_(
+                    jagged_data.values, non_blocking=True
+                )
+                copy_jagged_metadata(self._jagged_metadata, jagged_data)
+                self._kvcache_metadata.total_history_offsets += (
+                    self._jagged_metadata.num_candidates_offsets
+                )
+
+                hstu_output = self._hstu_block.predict_no_cache(
+                    batch.batch_size,
+                    num_tokens,
+                    self._hidden_states,
+                    self._jagged_metadata,
+                    # self._kvcache_metadata,
+                    False,
+                )
+                jagged_data.values = hstu_output
+            else:
+                # kvcache_metadata.total_history_offsets += (
+                #     jagged_data.num_candidates_offsets
+                # )
+                # # self.offload_kv_cache_wait(self._offload_states)
+                hstu_output = self._hstu_block.predict_no_cache(
+                    batch.batch_size,
+                    num_tokens,
+                    jagged_data.values,
+                    jagged_data,
+                    # kvcache_metadata,
+                    False,
+                )
+                jagged_data.values = hstu_output
+
+            # self._gpu_kv_cache_manager._offload_start_event.record(
+            #     torch.cuda.current_stream()
+            # )
+
+            jagged_data = self._hstu_block._postprocessor(jagged_data)
+            jagged_item_logit = self._mlp(jagged_data.values)
+            # self._offload_states = self.offload_kv_cache_async(
+            #     user_ids, kvcache_metadata
+            # )
+            # self.offload_kv_cache_wait(self._offload_states)
+            # self.finalize_kv_cache(user_ids)
 
         return jagged_item_logit

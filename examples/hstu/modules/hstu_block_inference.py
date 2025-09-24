@@ -84,6 +84,32 @@ class HSTUBlockInference(torch.nn.Module):
                 hidden_states,
                 kv_cache_metadata,
             )
+        
+    def predict_no_cache(
+        self,
+        batch_size: int,
+        num_tokens: int,
+        hidden_states: torch.Tensor,
+        jd: JaggedData,
+        use_cudagraph: bool = True,
+    ) -> torch.Tensor:
+        if self._hstu_graph is None or not use_cudagraph:
+            hidden_data = hidden_states
+            for hstu_layer in self._attention_layers:
+                # hidden_data = hstu_layer.forward_no_cache_naive(
+                #     batch_size, num_tokens, hidden_data, jd
+                # )
+                hidden_data = hstu_layer.forward_no_cache_naive(
+                    hidden_data, jd
+                )
+            return hidden_data
+        else:
+            # TODO: support cudagraph with no kv cache
+            return self.predict_no_cache_cudagraph(
+                batch_size,
+                num_tokens,
+                hidden_states,
+            )
 
     def predict_naive(
         self,
