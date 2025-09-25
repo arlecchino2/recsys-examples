@@ -168,6 +168,159 @@ class InferenceDataset(IterableDataset[Batch]):
                 torch.tensor(seq_endptrs),
             )
 
+    # def get_input_batch(
+    #     self,
+    #     user_ids,
+    #     dates,
+    #     sequence_endptrs,
+    #     sequence_startptrs,
+    #     with_contextual_features=False,
+    #     with_ranking_labels=False,
+    # ):
+    #     contextual_features: Dict[str, List[int]] = defaultdict(list)
+    #     contextual_features_seqlen: Dict[str, List[int]] = defaultdict(list)
+    #     item_features: List[int] = []
+    #     item_features_seqlen: List[int] = []
+    #     action_features: List[int] = []
+    #     action_features_seqlen: List[int] = []
+    #     num_candidates: List[int] = []
+    #     labels: List[int] = []
+
+    #     packed_user_ids: List[int] = []
+
+    #     if len(user_ids) == 0:
+    #         return None
+
+    #     sequence_endptrs = torch.clip(sequence_endptrs, 0, self._max_seqlen)
+    #     for idx in range(len(user_ids)):
+    #         uid = user_ids[idx].item()
+    #         date = dates[idx].item()
+    #         end_pos = sequence_endptrs[idx].item()  # history_end_pos
+    #         start_pos = sequence_startptrs[idx].item()
+
+    #         data = self._seq_logs_frame[
+    #             (self._seq_logs_frame[self._userid_name] == uid)
+    #             & (self._seq_logs_frame[self._date_name] == date)
+    #         ]
+    #         data = data.iloc[0]
+    #         if with_contextual_features:
+    #             for contextual_feature_name in self._contextual_feature_names:
+    #                 contextual_features[contextual_feature_name].append(
+    #                     data[contextual_feature_name]
+    #                 )
+    #                 contextual_features_seqlen[contextual_feature_name].append(1)
+
+    #         item_seq = load_seq(data[self._item_feature_name])[start_pos:end_pos]
+    #         action_seq = load_seq(data[self._action_feature_name])[start_pos:end_pos]
+    #         num_candidate = 0
+    #         if self._max_num_candidates > 0:
+    #             # randomly generated candidates
+    #             if not with_ranking_labels:
+    #                 # num_candidate = (torch.randint(self._max_num_candidates) + 1).item()
+    #                 num_candidate = self._max_num_candidates
+    #                 candidate_seq = torch.randint(
+    #                     self._item_vocab_size, (num_candidate,)
+    #                 ).tolist()
+
+    #             # extract candidates from following sequences
+    #             else:
+    #                 all_seqs = self._seq_logs_frame[
+    #                     (self._seq_logs_frame[self._userid_name] == uid)
+    #                     & (self._seq_logs_frame[self._date_name] >= date)
+    #                 ]
+    #                 candidate_seq = sum(
+    #                     [
+    #                         load_seq(all_seqs.iloc[idx][self._item_feature_name])
+    #                         for idx in range(len(all_seqs))
+    #                     ],
+    #                     start=[],
+    #                 )[end_pos : end_pos + self._max_num_candidates]
+    #                 num_candidate = len(candidate_seq)
+    #                 label_seq = sum(
+    #                     [
+    #                         load_seq(all_seqs.iloc[idx][self._action_feature_name])
+    #                         for idx in range(len(all_seqs))
+    #                     ],
+    #                     start=[],
+    #                 )[end_pos : end_pos + self._max_num_candidates]
+
+    #             all_item_seq = item_seq + candidate_seq
+
+    #         item_features.extend(all_item_seq)
+    #         item_features_seqlen.append(len(all_item_seq))
+    #         num_candidates.append(num_candidate)
+    #         if with_ranking_labels:
+    #             labels.extend(label_seq)
+
+    #         action_features.extend(action_seq)
+    #         action_features_seqlen.append(len(action_seq))
+
+    #         packed_user_ids.append(uid)
+
+    #     if len(packed_user_ids) == 0:
+    #         return None
+
+    #     feature_to_max_seqlen = {}
+    #     for name in self._contextual_feature_names:
+    #         feature_to_max_seqlen[name] = max(
+    #             contextual_features_seqlen[name], default=0
+    #         )
+
+    #     ### Currently use clipped maxlen. check how this impacts the hstu results
+    #     feature_to_max_seqlen[self._item_feature_name] = max(item_features_seqlen)
+    #     feature_to_max_seqlen[self._action_feature_name] = max(action_features_seqlen)
+
+    #     if with_contextual_features:
+    #         contextual_features_tensor = torch.tensor(
+    #             [contextual_features[name] for name in self._contextual_feature_names],
+    #         ).view(-1)
+    #         contextual_features_lengths_tensor = torch.tensor(
+    #             [
+    #                 contextual_features_seqlen[name]
+    #                 for name in self._contextual_feature_names
+    #             ]
+    #         ).view(-1)
+    #     else:
+    #         contextual_features_tensor = torch.empty((0,), dtype=torch.int64)
+    #         contextual_features_lengths_tensor = torch.tensor(
+    #             [0 for name in self._contextual_feature_names]
+    #         ).view(-1)
+    #     features = KeyedJaggedTensor.from_lengths_sync(
+    #         keys=self._contextual_feature_names
+    #         + [self._item_feature_name, self._action_feature_name],
+    #         values=torch.concat(
+    #             [
+    #                 contextual_features_tensor.to(device=self._device),
+    #                 torch.tensor(item_features, device=self._device),
+    #                 torch.tensor(action_features, device=self._device),
+    #             ]
+    #         ).long(),
+    #         lengths=torch.concat(
+    #             [
+    #                 contextual_features_lengths_tensor.to(device=self._device),
+    #                 torch.tensor(item_features_seqlen, device=self._device),
+    #                 torch.tensor(action_features_seqlen, device=self._device),
+    #             ]
+    #         ).long(),
+    #     )
+    #     labels = torch.tensor(labels, dtype=torch.int64, device=self._device)
+    #     batch_kwargs = dict(
+    #         features=features,
+    #         batch_size=self._batch_size,
+    #         feature_to_max_seqlen=feature_to_max_seqlen,
+    #         contextual_feature_names=self._contextual_feature_names,
+    #         item_feature_name=self._item_feature_name,
+    #         action_feature_name=self._action_feature_name,
+    #         max_num_candidates=self._max_num_candidates,
+    #         num_candidates=torch.tensor(num_candidates, device=self._device)
+    #         if self._max_num_candidates > 0
+    #         else None,
+    #     )
+    #     if with_ranking_labels:
+    #         return RankingBatch(labels=labels, **batch_kwargs)
+
+    #     return Batch(**batch_kwargs)
+    
     def get_input_batch(
         self,
         user_ids,

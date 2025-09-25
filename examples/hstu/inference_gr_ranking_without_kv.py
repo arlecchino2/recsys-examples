@@ -213,11 +213,10 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        # "blocks_in_primary_pool": 512,
-        "blocks_in_primary_pool": 4096,
+        "blocks_in_primary_pool": 8192,
         "page_size": 32,
         # "offload_chunksize": 32,
-        "offload_chunksize": 512,
+        "offload_chunksize": 32,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -264,6 +263,7 @@ def run_ranking_gr_simulate(
     inference_batch_size: int = 1,
     use_cudagraph: bool = False,
     full_mode: bool = True,
+    use_kvcache: bool = True,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -323,9 +323,9 @@ def run_ranking_gr_simulate(
         start_time = time.time()
         cur_date = None
         count = 0
+        # time_change = 0
         while True:
             try:
-                count += 1
                 uids, dates, seq_endptrs = next(dataloader_iter)
                 count += 1
                 print(f'{count}: {uids}')
@@ -369,16 +369,25 @@ def run_ranking_gr_simulate(
                     cur_date = dates[0]
                     if cur_date == 20220409:
                         break
-                cached_start_pos, cached_len = model.get_user_kvdata_info(
-                    uids, dbg_print=True
-                )
-                new_cache_start_pos = cached_start_pos + cached_len
-                logger.info(f'{count}: {new_cache_start_pos}')
-                non_contextual_mask = new_cache_start_pos >= num_contextual_features
-                contextual_mask = torch.logical_not(non_contextual_mask)
-                seq_startptrs = (
-                    torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
-                ).int()
+                if use_kvcache:
+                    cached_start_pos, cached_len = model.get_user_kvdata_info(
+                        uids, dbg_print=True
+                    )
+                    new_cache_start_pos = cached_start_pos + cached_len
+                    logger.info(f'{count}: {new_cache_start_pos}')
+                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                    contextual_mask = torch.logical_not(non_contextual_mask)
+                    seq_startptrs = (
+                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                    ).int()
+                else:
+                    new_cache_start_pos = torch.zeros_like(uids)
+                    logger.info(f'{count}: {new_cache_start_pos}')
+                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                    contextual_mask = torch.logical_not(non_contextual_mask)
+                    seq_startptrs = (
+                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                    ).int()
 
                 batch_0 = dataset.get_input_batch(
                     uids[non_contextual_mask],
@@ -405,11 +414,18 @@ def run_ranking_gr_simulate(
                     with_ranking_labels=True,
                 )
                 if batch_1 is not None:
-                    logits = model.forward(
-                        batch_1,
-                        uids[contextual_mask].int(),
-                        new_cache_start_pos[contextual_mask],
-                    )
+                    if use_kvcache:
+                        logits = model.forward(
+                            batch_1,
+                            uids[contextual_mask].int(),
+                            new_cache_start_pos[contextual_mask],
+                        )
+                    else:
+                        logits = model.forward_no_cache(
+                            batch_1,
+                            uids[contextual_mask].int(),
+                            new_cache_start_pos[contextual_mask],
+                        )
                     eval_module(logits, batch_1.labels)
 
                 num_batches_ctr += 1
@@ -438,8 +454,7 @@ def run_ranking_gr_evaluate(
         else 0
     )
 
-    # max_batch_size = 1
-    max_batch_size = 4
+    max_batch_size = 1
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
@@ -476,7 +491,7 @@ def run_ranking_gr_evaluate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
-            use_cudagraph,
+            use_cudagraph
         )
 
         eval_module = get_multi_event_metric_module(
@@ -574,4 +589,5 @@ if __name__ == "__main__":
             inference_batch_size=args.batch_size,
             use_cudagraph=args.use_cudagraph,
             full_mode=args.full_mode,
+            use_kvcache=args.use_kvcache
         )

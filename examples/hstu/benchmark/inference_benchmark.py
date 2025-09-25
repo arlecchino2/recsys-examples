@@ -35,11 +35,6 @@ from modules.gpu_memory_usage import print_gpu_memory_usage
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-# Set cuda device
-torch.cuda.set_device(1)
-device_id = torch.cuda.current_device()
-print(f"Current device: cuda:{torch.cuda.current_device()}")
-
 log_dir = "logs"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
@@ -60,13 +55,14 @@ file_handler.setFormatter(formatter)
 
 logger.addHandler(file_handler)
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Run inference benchmark with variable batch size")
     parser.add_argument('--batch_size', type=int, default=8, choices=[1, 2, 4, 5, 6, 7, 8, 10, 12, 14, 16],
                         help='Batch size for inference')
-    parser.add_argument('--use_kvcache', action='store_true', default=False,
-                        help='Whether to use kv_cache')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='Gpu device for inference')
+    # parser.add_argument('--use_kvcache', action='store_true', default=False,
+    #                     help='Whether to use kv_cache')
     parser.add_argument('--use_cudagraph', action='store_true', default=False,
                         help='Whether to use cuDagraph')
     parser.add_argument('--full_mode', action='store_true', default=False,
@@ -75,13 +71,11 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def run_ranking_gr_inference(inference_batch_size=8, _use_kvcache=True, _use_cudagraph=False, _full_mode=True):
-    # print("Current working directory:", os.getcwd())
-    max_batch_size = 16
-    # max_seqlen = 4096
+def run_ranking_gr_inference(inference_batch_size=8, _use_cudagraph=False, _full_mode=True):
+    max_batch_size = 8
     max_seqlen = 10240
     max_num_candidates = 256
-    max_incremental_seqlen = 256
+    max_incremental_seqlen = 8
 
     # context_emb_size = 1000
     item_fea_name, item_vocab_size = "item_feat", 10000
@@ -151,6 +145,7 @@ def run_ranking_gr_inference(inference_batch_size=8, _use_kvcache=True, _use_cud
         embedding_configs=emb_configs,
         prediction_head_arch=[[128, 10, 1] for _ in range(num_tasks)],
     )
+    logger.info(f"hstu_config: {hstu_config}, kv_cache_config: {kv_cache_config}")
 
     logger.info("Configurations:")
     logger.info(f"max_batch_size: {max_batch_size}, max_seqlen: {max_seqlen}, max_num_candidates: {max_num_candidates}")
@@ -212,16 +207,7 @@ def run_ranking_gr_inference(inference_batch_size=8, _use_kvcache=True, _use_cud
 
             model_predict.forward(batch, uids, truncate_start_pos)
 
-            # try:
-            #     torch.cuda.memory._dump_snapshot(f"memory.pickle")
-            # except Exception as e:
-            #     logger.error(f"Failed to capture memory snapshot {e}")
-
-            # # Stop recording memory snapshot history.
-            # torch.cuda.memory._record_memory_history(enabled=None)
-            # sys.exit(0)
-
-        num_test_batches = 8192
+        num_test_batches = 32
         ts_start, ts_end = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
         predict_time = 0.0
         for idx in range(num_test_batches):
@@ -244,16 +230,18 @@ def run_ranking_gr_inference(inference_batch_size=8, _use_kvcache=True, _use_cud
             ts_end.record()
             torch.cuda.synchronize()
             predict_time += ts_start.elapsed_time(ts_end)
-        # print("Total time(ms):", predict_time)
         logger.info(f"Total time(ms): {predict_time}")
 
 
 if __name__ == "__main__":
-    # run_ranking_gr_inference()
     args = parse_args()
+    # Set cuda device
+    torch.cuda.set_device(args.gpu)
+    # torch.cuda.set_device(2)
+    device_id = torch.cuda.current_device()
+    print(f"Current device: cuda:{torch.cuda.current_device()}")
     run_ranking_gr_inference(
         inference_batch_size=args.batch_size,
-        _use_kvcache=args.use_kvcache,
         _use_cudagraph=args.use_cudagraph,
         _full_mode=args.full_mode,
     )
