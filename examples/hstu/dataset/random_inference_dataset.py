@@ -56,6 +56,7 @@ class RandomInferenceDataGenerator:
     ):
         super().__init__()
 
+        self._device = torch.cuda.current_device()
         self._item_fea_name = item_feature_name
         self._action_fea_name = action_feature_name
         self._contextual_fea_names = contextual_feature_names
@@ -131,22 +132,22 @@ class RandomInferenceDataGenerator:
             self._user_40_repeat_count = 1  # 用于记录用户 40 的特殊处理次数
             self._user_5_repeat_count = 1  # 用于记录用户 5 的特殊处理次数
         
-        if 40 in range(self._current_user_id, self._current_user_id + batch_size):
-            if self._user_40_repeat_count < 8:
-                self._user_40_repeat_count += 1
-            else:
-                self._current_user_id += batch_size
-        elif 5 in range(self._current_user_id, self._current_user_id + batch_size):
-            if self._user_5_repeat_count < 2:
-                self._user_5_repeat_count += 1
-            else:
-                self._current_user_id += batch_size        
+        # if 40 in range(self._current_user_id, self._current_user_id + batch_size):
+        #     if self._user_40_repeat_count < 8:
+        #         self._user_40_repeat_count += 1
+        #     else:
+        #         self._current_user_id += batch_size
+        # elif 5 in range(self._current_user_id, self._current_user_id + batch_size):
+        #     if self._user_5_repeat_count < 2:
+        #         self._user_5_repeat_count += 1
+        #     else:
+        #         self._current_user_id += batch_size        
+        # else:
+        if self._current_user_count < 32:
+            self._current_user_count += 1
         else:
-            if self._current_user_count < 32:
-                self._current_user_count += 1
-            else:
-                self._current_user_id += batch_size
-                self._current_user_count = 1
+            self._current_user_id += batch_size
+            self._current_user_count = 1
 
         user_ids = torch.tensor(
             [self._current_user_id + i for i in range(batch_size)]
@@ -154,42 +155,45 @@ class RandomInferenceDataGenerator:
 
         return user_ids
 
-
     def get_random_inference_batch(
         self, user_ids, truncate_start_positions
     ) -> Optional[Batch]:
         batch_size = len(user_ids)
         if batch_size == 0:
             return None
-        user_ids = user_ids.tolist()
+        
+        user_ids = user_ids.to(self._device)
+        truncate_start_positions = truncate_start_positions.to(self._device)
+        
+        user_ids_list = user_ids.tolist()
         item_hists = [
-            self._item_history[uid] if uid in self._item_history else torch.tensor([])
-            for uid in user_ids
+            self._item_history[uid] if uid in self._item_history else torch.tensor([], device=self._device)
+            for uid in user_ids_list
         ]
         action_hists = [
             self._action_history[uid]
             if uid in self._action_history
-            else torch.tensor([])
-            for uid in user_ids
+            else torch.tensor([], device=self._device)
+            for uid in user_ids_list
         ]
 
-        lengths = torch.tensor([len(hist_seq) for hist_seq in item_hists]).long()
+        lengths = torch.tensor([len(hist_seq) for hist_seq in item_hists], device=self._device).long()
         incr_lengths = torch.randint(
-            low=1, high=self._max_incr_fea_len + 1, size=(batch_size,)
+            low=1, high=self._max_incr_fea_len + 1, size=(batch_size,), device=self._device
         )
         new_lengths = torch.clamp(lengths + incr_lengths, max=self._max_hist_len).long()
         incr_lengths = new_lengths - lengths
 
         num_candidates = torch.randint(
-            low=1, high=self._max_num_candidates + 1, size=(batch_size,)
+            low=1, high=self._max_num_candidates + 1, size=(batch_size,), device=self._device
         )
         if self._full_mode:
-            incr_lengths = torch.full((batch_size,), self._max_incr_fea_len)
+            incr_lengths = torch.full((batch_size,), self._max_incr_fea_len, device=self._device)
             new_lengths = torch.clamp(
                 lengths + incr_lengths, max=self._max_hist_len
             ).long()
             incr_lengths = new_lengths - lengths
-            num_candidates = torch.full((batch_size,), self._max_num_candidates)
+            num_candidates = torch.full((batch_size,), self._max_num_candidates, device=self._device)
 
         # Caveats: truncate_start_positions is for interleaved item-action sequence
         item_start_positions = (truncate_start_positions / 2).to(torch.int32)
@@ -197,18 +201,18 @@ class RandomInferenceDataGenerator:
 
         item_seq = list()
         action_seq = list()
-        for idx, uid in enumerate(user_ids):
+        for idx, uid in enumerate(user_ids_list):
             self._item_history[uid] = torch.cat(
                 [
                     item_hists[idx],
-                    torch.randint(self._max_item_id + 1, (incr_lengths[idx],)),
+                    torch.randint(self._max_item_id + 1, (incr_lengths[idx],), device=self._device),
                 ],
                 dim=0,
             ).long()
             self._action_history[uid] = torch.cat(
                 [
                     action_hists[idx],
-                    torch.randint(self._max_action_id + 1, (incr_lengths[idx],)),
+                    torch.randint(self._max_action_id + 1, (incr_lengths[idx],), device=self._device),
                 ],
                 dim=0,
             ).long()
@@ -216,7 +220,7 @@ class RandomInferenceDataGenerator:
             item_history = torch.cat(
                 [
                     self._item_history[uid][item_start_positions[idx] :],
-                    torch.randint(self._max_item_id + 1, (num_candidates[idx].item(),)),
+                    torch.randint(self._max_item_id + 1, (num_candidates[idx].item(),), device=self._device),
                 ],
                 dim=0,
             )

@@ -112,9 +112,9 @@ def run_ranking_gr_inference(inference_batch_size=8, _use_cudagraph=False, _full
     )
 
     # _blocks_in_primary_pool = 40960
-    _blocks_in_primary_pool = 20480
+    _blocks_in_primary_pool = 8193
     _page_size = 32
-    _offload_chunksize = 8192
+    _offload_chunksize = 128
     kv_cache_config = get_kvcache_config(
         blocks_in_primary_pool=_blocks_in_primary_pool,
         page_size=_page_size,

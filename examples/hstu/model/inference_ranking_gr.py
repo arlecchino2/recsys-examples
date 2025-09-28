@@ -149,8 +149,8 @@ class InferenceRankingGR(torch.nn.Module):
         self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
         self._mlp = MLP(
             self._embedding_dim,
-            # task_config.prediction_head_arch[0],
-            task_config.prediction_head_arch, # For benchmark
+            # task_config.prediction_head_arch[0], # For benchmark
+            task_config.prediction_head_arch,
             task_config.prediction_head_act_type,
             task_config.prediction_head_bias,
             device=self._device,
@@ -404,7 +404,6 @@ class InferenceRankingGR(torch.nn.Module):
     def prepare_kv_cache(
         self, batch: Batch, user_ids: torch.Tensor, user_start_pos: torch.Tensor
     ) -> KVCacheMetadata:
-        torch.cuda.synchronize()
         batch_size = user_ids.shape[0]
         # new_history_lengths = (
         #     torch.sum(batch.features.lengths().view(-1, batch.batch_size), 0).view(-1)
@@ -420,16 +419,17 @@ class InferenceRankingGR(torch.nn.Module):
             cached_lengths,
         ) = self._gpu_kv_cache_manager.get_batch_kvdata_info(user_ids)
 
-        # wx: Using new function to handle evicted users when allocating new requests
-        # self._gpu_kv_cache_manager.allocate(
-        #     user_ids, user_start_pos, new_history_lengths
-        # )
-        self._gpu_kv_cache_manager.allocate_with_eviction_handling(
-            user_ids, 
-            user_start_pos,
-            new_history_lengths,
-            evicted_offload_callback=self._handle_evicted_users_offload
+        
+        self._gpu_kv_cache_manager.allocate(
+            user_ids, user_start_pos, new_history_lengths
         )
+        # wx: Using new function to handle evicted users when allocating new requests
+        # self._gpu_kv_cache_manager.allocate_with_eviction_handling(
+        #     user_ids, 
+        #     user_start_pos,
+        #     new_history_lengths,
+        #     evicted_offload_callback=self._handle_evicted_users_offload
+        # )
         kv_cache_metadata = self._gpu_kv_cache_manager.get_cache_metadata(user_ids)
         append_metadata = self._gpu_kv_cache_manager.get_append_metadata(
             new_history_lengths, kv_cache_metadata.total_history_lengths
@@ -463,16 +463,6 @@ class InferenceRankingGR(torch.nn.Module):
         # self.logger.info(f"onload_kv_page_ids: {onload_kv_page_ids}")
         # self.logger.info(f"kv_cache_metadata.kv_indices: {kv_cache_metadata.kv_indices}")
         if onload_length > 0:
-            # 当kv缓存需要从gpu和cpu(可选)上共同构建时
-            # if kv_cache_metadata.kv_indices.numel() > 0:
-                # kv_page_ids = triton_concat_2D_jagged(
-                #     max_seq_len=onload_kv_page_indptr[-1]
-                #     + kv_cache_metadata.kv_indptr[-1],
-                #     values_a=onload_kv_page_ids.view(-1, 1),
-                #     values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-                #     offsets_a=onload_kv_page_indptr.to(torch.int64),
-                #     offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
-                # )
             kv_page_ids = triton_concat_2D_jagged(
                 max_seq_len=onload_kv_page_indptr[-1] + kv_cache_metadata.kv_indptr[-1],
                 values_a=onload_kv_page_ids.view(-1, 1),
@@ -480,15 +470,7 @@ class InferenceRankingGR(torch.nn.Module):
                 offsets_a=onload_kv_page_indptr.to(torch.int64),
                 offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
             )
-            # 当kv缓存只需要从cpu上构建时 kv_cache_metadata.kv_indices为空 故不可用索引访问
-            # else:
-            #     kv_page_ids = triton_concat_2D_jagged(
-            #         max_seq_len=onload_kv_page_indptr[-1],
-            #         values_a=onload_kv_page_ids.view(-1, 1),
-            #         values_b=kv_cache_metadata.kv_indices.view(-1, 1),
-            #         offsets_a=onload_kv_page_indptr.to(torch.int64),
-            #         offsets_b=kv_cache_metadata.kv_indptr.to(torch.int64),
-            #     )
+
             kv_cache_metadata.kv_indices = kv_page_ids.view(-1)
             kv_cache_metadata.kv_indptr = (
                 onload_kv_page_indptr + kv_cache_metadata.kv_indptr
@@ -502,7 +484,7 @@ class InferenceRankingGR(torch.nn.Module):
         # cudagraph preparation
         if self.use_cudagraph:
             copy_kvcache_metadata(self._kvcache_metadata, kv_cache_metadata)
-        assert max(kv_cache_metadata.kv_indices.tolist()) < self._kvcache_metadata.kv_cache_table[0].shape[0]
+        # assert max(kv_cache_metadata.kv_indices.tolist()) < self._kvcache_metadata.kv_cache_table[0].shape[0]
 
         return kv_cache_metadata
 
@@ -592,7 +574,6 @@ class InferenceRankingGR(torch.nn.Module):
                 self._kvcache_metadata.total_history_offsets += (
                     self._jagged_metadata.num_candidates_offsets
                 )
-                # self.offload_kv_cache_wait(self._offload_states)
 
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
@@ -606,7 +587,6 @@ class InferenceRankingGR(torch.nn.Module):
                 kvcache_metadata.total_history_offsets += (
                     jagged_data.num_candidates_offsets
                 )
-                # self.offload_kv_cache_wait(self._offload_states)
                 hstu_output = self._hstu_block.predict(
                     batch.batch_size,
                     num_tokens,

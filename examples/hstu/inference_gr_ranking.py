@@ -314,66 +314,27 @@ def run_ranking_gr_simulate(
             date_name="date",
             sequence_endptr_name="interval_indptr",
             timestamp_names=["date", "interval_end_ts"],
+            max_num_users=1024,
+            max_incremental_seqlen=64,
+            full_mode=full_mode,
         )
-
-        dataloader = get_data_loader(dataset=dataset)
-        dataloader_iter = iter(dataloader)
 
         num_batches_ctr = 0
         start_time = time.time()
-        cur_date = None
-        count = 0
-        while True:
+        model.clear_kv_cache()
+        for iteration in range(1000):
             try:
-                count += 1
-                uids, dates, seq_endptrs = next(dataloader_iter)
-                count += 1
-                print(f'{count}: {uids}')
-                # logger.info(f'{count}: {uids}')
-                first_occurrence = torch.zeros_like(uids, dtype=torch.bool)
-                seen_uids = set()
-
-                for i, uid in enumerate(uids):
-                    uid_item = uid.item()
-                    if uid_item not in seen_uids:
-                        first_occurrence[i] = True
-                        seen_uids.add(uid_item)
-
-                # 获取按原始顺序的唯一用户
-                unique_uids = uids[first_occurrence]
-
-                # 为每个唯一用户合并数据
-                merged_seq_endptrs = []
-                merged_dates = []
-
-                for uid in unique_uids:
-                    user_mask = (uids == uid)
-                    merged_seq_endptrs.append(torch.max(seq_endptrs[user_mask]))
-                    merged_dates.append(dates[user_mask][0])
-
-                # 更新数据
-                uids = unique_uids
-                dates = torch.stack(merged_dates)
-                seq_endptrs = torch.stack(merged_seq_endptrs)
-                logger.info(f'{count}: {uids}, {seq_endptrs}')
-                if dates[0] != cur_date:
-                    if cur_date is not None:
-                        eval_metric_dict = eval_module.compute()
-                        print(
-                            f"[eval]:\n    "
-                            + stringify_dict(
-                                eval_metric_dict, prefix="Metrics", sep="\n    "
-                            )
-                        )
-                    model.clear_kv_cache()
-                    cur_date = dates[0]
-                    if cur_date == 20220409:
-                        break
+                batch_data = dataset.get_inference_batch_user_ids()
+                if batch_data is None:
+                    break
+                uids, dates, seq_endptrs = batch_data
+                logger.info(f'{iteration}: uids:{uids.detach().cpu().numpy()}')
+                    
                 cached_start_pos, cached_len = model.get_user_kvdata_info(
                     uids, dbg_print=True
                 )
                 new_cache_start_pos = cached_start_pos + cached_len
-                logger.info(f'{count}: {new_cache_start_pos}')
+                logger.info(f'{iteration}: new_cache_sp:{new_cache_start_pos}')
                 non_contextual_mask = new_cache_start_pos >= num_contextual_features
                 contextual_mask = torch.logical_not(non_contextual_mask)
                 seq_startptrs = (

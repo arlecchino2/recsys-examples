@@ -14,16 +14,16 @@
 # limitations under the License.
 from typing import List, Optional, Tuple
 
-# import tensorrt_llm
+import tensorrt_llm
 import sys
-sys.path.append('/workdir/test/tensorrt-llm-kvcache/cpp/build/tensorrt_llm/pybind')  # 确保模块路径在系统路径中
-import bindings
+# sys.path.append('/workdir/test/tensorrt-llm-kvcache/cpp/build/tensorrt_llm/pybind')  # 确保模块路径在系统路径中
+# import bindings
 import torch
 from configs import InferenceHSTUConfig, KVCacheConfig
 
-KVCacheManagerImpl = bindings.internal.batch_manager.KVCacheManager
-KvCacheConfigCpp = bindings.KvCacheConfig
-DataType = bindings.DataType
+# KVCacheManagerImpl = bindings.internal.batch_manager.KVCacheManager
+# KvCacheConfigCpp = bindings.KvCacheConfig
+# DataType = bindings.DataType
 
 
 class HSTUHostKVStorageImpl:
