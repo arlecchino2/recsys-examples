@@ -515,10 +515,10 @@ class InferenceRankingGR(torch.nn.Module):
                 batch=batch,
                 seq_start_position=user_start_pos_cuda,
             )
-            # self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
-            # self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
-            # self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
-            # self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
+            self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
+            self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
+            self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
+            self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
 
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
@@ -577,12 +577,12 @@ class InferenceRankingGR(torch.nn.Module):
             user_start_pos_cuda = user_start_pos.to(
                 device=torch.cuda.current_device(), non_blocking=True
             )
-            # kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
-            # # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
-            # self.logger.info(f"====== After preparing kv cache ======")
-            # self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
-            # self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
-            # self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
+            kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
+            self.logger.info(f"====== After preparing kv cache ======")
+            self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
+            self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
+            self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos

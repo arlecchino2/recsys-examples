@@ -216,7 +216,7 @@ def get_inference_hstu_model(
         "blocks_in_primary_pool": 8192,
         "page_size": 32,
         # "offload_chunksize": 32,
-        "offload_chunksize": 512,
+        "offload_chunksize": 1024,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -417,6 +417,8 @@ def run_ranking_gr_simulate(
         end_time = time.time()
         print("Total #batch:", num_batches_ctr)
         print("Total time(s):", end_time - start_time)
+        logger.info(f"Total #batch: {num_batches_ctr}")
+        logger.info(f"Total time(s): {end_time - start_time}")
 
 
 def run_ranking_gr_evaluate(

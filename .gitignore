@@ -32,3 +32,4 @@ embedding_checkpoint/
 *.xlsx
 pcie_lookup_poc/*
 tensorrt-llm-kvcache/
+inference_gr_ranking_without_kv.py

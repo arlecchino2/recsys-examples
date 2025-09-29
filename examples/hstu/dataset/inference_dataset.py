@@ -343,6 +343,11 @@ class InferenceDataset(IterableDataset[Batch]):
 
         if len(user_ids) == 0:
             return None
+        
+        if isinstance(with_contextual_features, bool):
+            contextual_mask = [with_contextual_features] * len(user_ids)
+        else:
+            contextual_mask = with_contextual_features
 
         sequence_endptrs = torch.clip(sequence_endptrs, 0, self._max_seqlen)
         for idx in range(len(user_ids)):
@@ -356,12 +361,21 @@ class InferenceDataset(IterableDataset[Batch]):
                 & (self._seq_logs_frame[self._date_name] == date)
             ]
             data = data.iloc[0]
-            if with_contextual_features:
+            # if with_contextual_features:
+            #     for contextual_feature_name in self._contextual_feature_names:
+            #         contextual_features[contextual_feature_name].append(
+            #             data[contextual_feature_name]
+            #         )
+            #         contextual_features_seqlen[contextual_feature_name].append(1)
+            if contextual_mask[idx]:
                 for contextual_feature_name in self._contextual_feature_names:
                     contextual_features[contextual_feature_name].append(
                         data[contextual_feature_name]
                     )
                     contextual_features_seqlen[contextual_feature_name].append(1)
+            else:
+                for contextual_feature_name in self._contextual_feature_names:
+                    contextual_features_seqlen[contextual_feature_name].append(0)
 
             item_seq = load_seq(data[self._item_feature_name])[start_pos:end_pos]
             action_seq = load_seq(data[self._action_feature_name])[start_pos:end_pos]
@@ -423,40 +437,52 @@ class InferenceDataset(IterableDataset[Batch]):
         feature_to_max_seqlen[self._item_feature_name] = max(item_features_seqlen)
         feature_to_max_seqlen[self._action_feature_name] = max(action_features_seqlen)
 
-        if with_contextual_features:
+        # if with_contextual_features:
+        #     contextual_features_tensor = torch.tensor(
+        #         [contextual_features[name] for name in self._contextual_feature_names],
+        #     ).view(-1)
+        #     contextual_features_lengths_tensor = torch.tensor(
+        #         [
+        #             contextual_features_seqlen[name]
+        #             for name in self._contextual_feature_names
+        #         ]
+        #     ).view(-1)
+        # else:
+        #     contextual_features_tensor = torch.empty((0,), dtype=torch.int64)
+        #     # contextual_features_lengths_tensor = torch.tensor(
+        #     #     [0 for name in self._contextual_feature_names]
+        #     # ).view(-1)
+        #     # Create zero lengths for each contextual feature per batch sample to maintain tensor shape consistency
+        #     contextual_features_lengths_tensor = torch.tensor(
+        #         [0 for _ in range(len(user_ids) * len(self._contextual_feature_names))]
+        #     ).view(-1)
+        #     # features = KeyedJaggedTensor.from_lengths_sync(
+        #     #     keys=[self._item_feature_name, self._action_feature_name],
+        #     #     values=torch.concat(
+        #     #         [
+        #     #             torch.tensor(item_features, device=self._device),
+        #     #             torch.tensor(action_features, device=self._device),
+        #     #         ]
+        #     #     ).long(),
+        #     #     lengths=torch.concat(
+        #     #         [
+        #     #             torch.tensor(item_features_seqlen, device=self._device),
+        #     #             torch.tensor(action_features_seqlen, device=self._device),
+        #     #         ]
+        #     #     ).long(),
+        #     # )
+        if any(len(contextual_features[name]) > 0 for name in self._contextual_feature_names):
             contextual_features_tensor = torch.tensor(
-                [contextual_features[name] for name in self._contextual_feature_names],
-            ).view(-1)
+                [val for name in self._contextual_feature_names for val in contextual_features[name]]
+            )
             contextual_features_lengths_tensor = torch.tensor(
-                [
-                    contextual_features_seqlen[name]
-                    for name in self._contextual_feature_names
-                ]
-            ).view(-1)
+                [length for name in self._contextual_feature_names for length in contextual_features_seqlen[name]]
+            )
         else:
             contextual_features_tensor = torch.empty((0,), dtype=torch.int64)
-            # contextual_features_lengths_tensor = torch.tensor(
-            #     [0 for name in self._contextual_feature_names]
-            # ).view(-1)
-            # Create zero lengths for each contextual feature per batch sample to maintain tensor shape consistency
             contextual_features_lengths_tensor = torch.tensor(
-                [0 for _ in range(len(user_ids) * len(self._contextual_feature_names))]
-            ).view(-1)
-            # features = KeyedJaggedTensor.from_lengths_sync(
-            #     keys=[self._item_feature_name, self._action_feature_name],
-            #     values=torch.concat(
-            #         [
-            #             torch.tensor(item_features, device=self._device),
-            #             torch.tensor(action_features, device=self._device),
-            #         ]
-            #     ).long(),
-            #     lengths=torch.concat(
-            #         [
-            #             torch.tensor(item_features_seqlen, device=self._device),
-            #             torch.tensor(action_features_seqlen, device=self._device),
-            #         ]
-            #     ).long(),
-            # )
+                [length for name in self._contextual_feature_names for length in contextual_features_seqlen[name]]
+            )
         features = KeyedJaggedTensor.from_lengths_sync(
             keys=self._contextual_feature_names
             + [self._item_feature_name, self._action_feature_name],
