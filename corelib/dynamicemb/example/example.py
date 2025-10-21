@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import urllib.request
+import warnings
 import zipfile
 from typing import Dict, List
 
@@ -20,14 +21,16 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
+from dynamicemb.dynamicemb_config import data_type_to_dtype, get_optimizer_state_dim
 from dynamicemb.incremental_dump import get_score, incremental_dump
+from dynamicemb.optimizer import EmbOptimType, convert_optimizer_type
 from dynamicemb.planner import (
     DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
-from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
+from fbgemm_gpu.split_embedding_configs import SparseType
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -43,10 +46,16 @@ from torchrec.distributed.planner import Topology
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
+from torchrec.distributed.planner.types import ShardingPlan
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+# Filter FBGEMM warning, make notebook clean
+warnings.filterwarnings(
+    "ignore", message=".*torch.library.impl_abstract.*", category=FutureWarning
+)
 
 backend = "nccl"
 dist.init_process_group(backend=backend)
@@ -63,7 +72,7 @@ if "LOCAL_RANK" not in os.environ:
 if "RANK" not in os.environ:
     os.environ["RANK"] = str(dist.get_rank())
 
-local_rank = get_local_rank()
+local_rank = dist.get_rank()  # for one node
 world_size = dist.get_world_size()
 torch.cuda.set_device(local_rank)
 device = torch.device(f"cuda:{local_rank}")
@@ -76,6 +85,7 @@ def rank_print(*args, **kwargs):
 
 
 builtins.print = rank_print
+cache_ratio = 0.5  # assume we will use 50% of the HBM for cache
 
 
 def download_movielens(data_dir="./ml-1m"):
@@ -111,9 +121,13 @@ def download_movielens(data_dir="./ml-1m"):
 def parse_args():
     parser = argparse.ArgumentParser(description="TorchRec MovieLens with dynamicemb")
     parser.add_argument("--train", action="store_true")
+    parser.add_argument("--eval", action="store_true")
     parser.add_argument("--load", action="store_true")
     parser.add_argument("--dump", action="store_true")
     parser.add_argument("--incremental_dump", action="store_true")
+    parser.add_argument("--caching", action="store_true")
+    parser.add_argument("--prefetch_pipeline", action="store_true")
+    parser.add_argument("--external_storage", action="store_true")
 
     parser.add_argument(
         "--data_path",
@@ -353,80 +367,7 @@ class MovieLensModel(nn.Module):
         return torch.sum(x.t(), dim=-1)
 
 
-# use a function warp all the Planner code
-def get_planner(device, eb_configs, batch_size):
-    DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
-        DataType.FP32: 32,
-        DataType.FP16: 16,
-        DataType.BF16: 16,
-    }
-
-    hbm_cap = 80 * 1024 * 1024 * 1024  # H100's HBM bytes per GPU
-    ddr_cap = 512 * 1024 * 1024 * 1024  # Assume a Node have 512GB memory
-    intra_host_bw = 450e9  # Nvlink bandwidth
-    inter_host_bw = 25e9  # NIC bandwidth
-
-    dict_const = {}
-
-    for eb_config in eb_configs:
-        # For HVK  embedding table , need to calculate how many bytes of embedding vector store in GPU HBM
-        # In this case , we will put all the embedding vector into GPU HBM
-        dim = eb_config.embedding_dim
-        tmp_type = eb_config.data_type
-
-        embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
-        emb_num_embeddings = eb_config.num_embeddings
-        emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
-            math.log2(emb_num_embeddings)
-        )  # HKV need embedding vector num is power of 2
-        total_hbm_need = embedding_type_bytes * dim * emb_num_embeddings_next_power_of_2
-
-        const = DynamicEmbParameterConstraints(
-            sharding_types=[
-                ShardingType.ROW_WISE.value,
-            ],
-            use_dynamicemb=True,  # from here , is all the HKV options , default use_dynamicemb is False , if it is False , it will fallback to raw TorchREC ParameterConstraints
-            dynamicemb_options=DynamicEmbTableOptions(
-                global_hbm_for_values=total_hbm_need,
-                initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.NORMAL
-                ),
-                score_strategy=DynamicEmbScoreStrategy.STEP,
-            ),
-        )
-
-        dict_const[eb_config.name] = const
-
-    topology = Topology(
-        local_world_size=get_local_size(),
-        world_size=dist.get_world_size(),
-        compute_device=device.type,
-        hbm_cap=hbm_cap,
-        ddr_cap=ddr_cap,  # For HVK  , if we need to put embedding vector into Host memory , it is important set ddr capacity
-        intra_host_bw=intra_host_bw,
-        inter_host_bw=inter_host_bw,
-    )
-
-    # Same usage of  TorchREC's EmbeddingEnumerator
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=dict_const,
-    )
-
-    # Almost same usage of  TorchREC's EmbeddingShardingPlanner , but we need to input eb_configs, so we can plan every GPU's HKV object.
-    return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
-        topology=topology,
-        constraints=dict_const,
-        batch_size=batch_size,
-        enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
-        debug=True,
-    )
-
-
-def apply_dmp(model, args):
-    eb_configs = model.embedding_module.embedding_configs()
+def get_sharder(args, optimizer_type):
     # set optimizer args
     learning_rate = args.lr
     beta1 = 0.9
@@ -434,9 +375,9 @@ def apply_dmp(model, args):
     weight_decay = 0
     eps = 0.001
 
-    # Put args into a optimizer kwargs , which is same usage of TorchREC
+    # Put args into a optimizer kwargs , which is same usage of torchrec
     optimizer_kwargs = {
-        "optimizer": EmbOptimType.ADAM,
+        "optimizer": optimizer_type,
         "learning_rate": learning_rate,
         "beta1": beta1,
         "beta2": beta2,
@@ -445,8 +386,15 @@ def apply_dmp(model, args):
     }
 
     fused_params = {}
-    fused_params["output_dtype"] = SparseType.FP32
+    fused_params[
+        "output_dtype"
+    ] = (
+        SparseType.FP32
+    )  # data type of the output after lookup, and can differ from the stored.
     fused_params.update(optimizer_kwargs)
+    fused_params[
+        "prefetch_pipeline"
+    ] = args.prefetch_pipeline  # whether enable prefetch for embedding lookup module
 
     # precision of all-to-all
     qcomm_codecs_registry = (
@@ -462,20 +410,169 @@ def apply_dmp(model, args):
         else None
     )
 
-    # Create a sharder , same usage with TorchREC , but need Use DynamicEmb function, because for index_dedup
-    # DynamicEmb overload this process to fit HKV
-
-    sharder = DynamicEmbeddingCollectionSharder(
+    """
+    fused_params: 
+        items in fused_params will be finally passed to embedding lookup module. But before that:  
+            logic tables in `EmbeddingCollection` will be divided into multiple groups in the `ShardedDynamicEmbeddingCollection`, 
+            and the fused_params are equal for tables in the same group. 
+        However, we only provide the common for all tables here, but some fields in `DynamicEmbTableOptions` will be merged into fused_params 
+            and then be used to group tables(please refer DynamicEmbTableOptions for more details).
+        **Performance** issue: Embedding lookup within the same group can be executed in parallel, 
+            while embedding lookup between different groups can only be executed sequentially.
+    use_index_dedup: 
+        Unlike `EmbeddingBagCollection`, there is no reduction operation at the jagged dimension in the input `KeyedJaggedTensor` for `EmbeddingCollection`.
+        Therefore, we can deduplicate the input's indices in the input distributor before sparse feature's all-to-all, 
+            then it will reduce the bandwidth pressure of NVLink or PCIe when perform embedding's all-to-all, and restore them using inverse information finally.
+    qcomm_codecs_registry: used to configure the embeddings(forward) or gradients(backward)' precision when perform all-to-all operation across different ranks 
+        in distributed environment. 
+    """
+    return DynamicEmbeddingCollectionSharder(
         qcomm_codecs_registry=qcomm_codecs_registry,
         fused_params=fused_params,
         use_index_dedup=True,
     )
 
-    planner = get_planner(device, eb_configs, args.batch_size)
-    # Same usage of TorchREC
-    plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
 
-    # Same usage of TorchREC
+# use a function warp all the Planner code
+def get_planner(device, eb_configs, batch_size, optimizer_type, training, caching):
+    DATA_TYPE_NUM_BITS: Dict[DataType, int] = {
+        DataType.FP32: 32,
+        DataType.FP16: 16,
+        DataType.BF16: 16,
+    }
+
+    hbm_cap = 80 * 1024 * 1024 * 1024  # H100's HBM bytes per GPU
+    ddr_cap = 512 * 1024 * 1024 * 1024  # Assume a Node have 512GB memory
+    intra_host_bw = 450e9  # Nvlink bandwidth
+    inter_host_bw = 25e9  # NIC bandwidth
+    bucket_capacity = 1024 if caching else 128
+
+    dict_const = {}
+
+    for eb_config in eb_configs:
+        # For HVK  embedding table, need to calculate how many bytes of embedding vector store in GPU HBM
+        dim = eb_config.embedding_dim
+        tmp_type = eb_config.data_type
+
+        embedding_type_bytes = DATA_TYPE_NUM_BITS[tmp_type] / 8
+        emb_num_embeddings = eb_config.num_embeddings
+        emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
+            math.log2(emb_num_embeddings)
+        )  # HKV need embedding vector num is power of 2
+        threshold = (bucket_capacity * world_size) / cache_ratio
+        threshold_int = math.ceil(threshold)
+        if emb_num_embeddings_next_power_of_2 < threshold_int:
+            emb_num_embeddings_next_power_of_2 = 2 ** math.ceil(
+                math.log2(threshold_int)
+            )
+
+        # e.g. for adam, its `x`` embedding + `2x`` optimizer states
+        total_dim = dim + get_optimizer_state_dim(
+            convert_optimizer_type(optimizer_type), dim, data_type_to_dtype(tmp_type)
+        )
+        total_hbm_need = (
+            embedding_type_bytes * total_dim * emb_num_embeddings_next_power_of_2
+        )
+
+        const = DynamicEmbParameterConstraints(
+            sharding_types=[
+                ShardingType.ROW_WISE.value,  # dynamicemb embedding table only support to be sharded in row-wise.
+            ],
+            use_dynamicemb=True,  # indicate using dynamicemb, and will fallback to raw ParameterConstraints when Fale.
+            dynamicemb_options=DynamicEmbTableOptions(
+                global_hbm_for_values=total_hbm_need * cache_ratio
+                if caching
+                else total_hbm_need,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.NORMAL
+                ),
+                score_strategy=DynamicEmbScoreStrategy.STEP,
+                caching=caching,
+                training=training,
+            ),
+        )
+
+        dict_const[eb_config.name] = const
+
+    topology = Topology(
+        local_world_size=get_local_size(),
+        world_size=dist.get_world_size(),
+        compute_device=device.type,
+        hbm_cap=hbm_cap,
+        ddr_cap=ddr_cap,
+        intra_host_bw=intra_host_bw,
+        inter_host_bw=inter_host_bw,
+    )
+
+    # same usage of  torchrec's EmbeddingEnumerator
+    enumerator = DynamicEmbeddingEnumerator(
+        topology=topology,
+        constraints=dict_const,
+    )
+
+    # Almost same usage of  torchrec's EmbeddingShardingPlanner, except to input eb_configs,
+    #   as dynamicemb need EmbeddingConfig info to help to plan.
+    return DynamicEmbeddingShardingPlanner(
+        eb_configs=eb_configs,
+        topology=topology,
+        constraints=dict_const,
+        batch_size=batch_size,
+        enumerator=enumerator,
+        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
+        debug=True,
+    )
+
+
+def apply_dmp(model, args, training):
+    """
+    The initialization of embedding lookup module in dynamicemb is almost consistent with torchrec.
+        1. Firstly, you should configure the global parameters of an embedding table using `EmbeddingCollection`.
+        2. Then, build a `DynamicEmbeddingCollectionSharder`, and generate `ShardingPlan` from `DynamicEmbeddingShardingPlanner`.
+        3. Finally, pass all parameters to the `DistributedModelParallel`, which then handles the embedding sharding and initialization.
+    """
+    eb_configs = model.embedding_module.embedding_configs()
+    optimizer_type = EmbOptimType.ADAM
+
+    """
+    After configuring the `EmbeddingCollection`, you need to configure `DynamicEmbeddingCollectionSharder`. 
+    It can create an instance of `ShardedDynamicEmbeddingCollection`.
+    `ShardedDynamicEmbeddingCollection` provides customized embedding lookup module base on 
+        [HKV](https://github.com/NVIDIA-Merlin/HierarchicalKV), a GPU hash table which can utilize both device and host memory,
+        support automatic eviction based on score(per key) while provide a better performance.
+    Besides, due to differences in deduplication between hash tables and array based static tables, 
+        `ShardedDynamicEmbeddingCollection` also provide customized input distributor to support deduplication when `use_index_dedup=True`.
+    The actual sharding operation occurs during the initialization of the `ShardedDynamicEmbeddingCollection`, 
+        but the parameters used to initialize `DynamicEmbeddingCollectionSharder`  will play a key role in the sharding process.
+    By the way, `DynamicEmbeddingCollectionSharder` inherits `EmbeddingCollectionSharder`, 
+        and its main job is return an instance of `ShardedDynamicEmbeddingCollection`.
+    """
+    sharder = get_sharder(args, optimizer_type)
+
+    """
+    The next step of preparation is to generate a `ParameterSharding` for each table, describe (configure) the sharding of a parameter. 
+    For dynamic embedding table, `DynamicEmbParameterSharding` will be generated, which includes the parameters required from our embedding lookup module.
+    We will not expand `DynamicEmbParameterSharding` here. 
+    The following steps demonstrate how to obtain `DynamicEmbParameterSharding` by `DynamicEmbeddingShardingPlanner`.
+    """
+    planner = get_planner(
+        device,
+        eb_configs,
+        args.batch_size,
+        optimizer_type=optimizer_type,
+        training=training,
+        caching=args.caching,
+    )
+    # get plan for all ranks.
+    # ShardingPlan is a dict, mapping table name to ParameterSharding/DynamicEmbParameterSharding.
+    plan: ShardingPlan = planner.collective_plan(
+        model, [sharder], dist.GroupMember.WORLD
+    )
+
+    """
+    The final step is to input the `sharder` and `ShardingPlan` to the `DistributedModelParallel`, 
+        who will implement the sharded plan through `sharder` and hold the `ShardedDynamicEmbeddingCollection` after sharding.
+    Then you can use `dmp` for **training** and **evaluation**, just like using `EmbeddingCollection`.
+    """
     dmp = DistributedModelParallel(
         module=model,
         device=device,
@@ -486,13 +583,17 @@ def apply_dmp(model, args):
     return dmp
 
 
-def create_model(args):
+def create_model(args, training=True):
+    # Define the configuration parameters for the embedding table,
+    # including its name, embedding dimension, total number of embeddings, and feature name.
     eb_configs = [
         EmbeddingConfig(
             name="user_id",
             embedding_dim=args.embedding_dim,
-            num_embeddings=args.num_embeddings,  # sum for all ranks.
-            feature_names=["user_id"],
+            num_embeddings=args.num_embeddings,  # `num_embeddings` in `EmbeddingConfig` is the sum of all slices on all GPUs for a table.
+            feature_names=[
+                "user_id"
+            ],  # a list, means different features can share the same table
             data_type=DataType.FP32,  # weight or embedding's data type.
         ),
         EmbeddingConfig(
@@ -527,6 +628,10 @@ def create_model(args):
         ),
     ]
 
+    """
+    `EmbeddingCollection` is a collection of multiple logical tables.
+    It does not allocate memory for embedding tables(device is "meta").
+    """
     ec = EmbeddingCollection(
         tables=eb_configs,
         device=torch.device("meta"),  # set device to 'meta
@@ -541,7 +646,7 @@ def create_model(args):
         over_arch_layer_sizes=mlp_dims,
     )
 
-    model = apply_dmp(model, args)
+    model = apply_dmp(model, args, training)
 
     return model
 
@@ -665,7 +770,6 @@ def dump(args):
                 args.save_dir, f"model_epoch_{epoch+1}_rank{dist.get_rank()}.pt"
             ),
         )
-    # rank0 will gether embedding from other ranks, so no need to identify rank info.
     DynamicEmbDump(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
 
 
@@ -703,7 +807,6 @@ def load(args):
     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-    # all rank will load from the same files.
     DynamicEmbLoad(os.path.join(args.save_dir, "dynamicemb"), model, optim=True)
 
     test_one_epoch(model, test_loader, criterion, 0, 1)

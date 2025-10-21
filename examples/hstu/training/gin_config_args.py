@@ -28,20 +28,23 @@ class TrainerArgs:
 
     eval_interval: int = 100
     log_interval: int = 100
-
+    max_train_iters: Optional[int] = None
+    max_eval_iters: Optional[int] = None
     seed: int = 1234
-    # ==nsys args==
+
+    # ==profile args==
     profile: bool = False
     profile_step_start: int = 100
     profile_step_end: int = 200
-    # ==nsys args==
-    max_train_iters: Optional[int] = None
-    max_eval_iters: Optional[int] = None
-
-    # ckpt args
+    # ==ckpt args==
     ckpt_save_interval: int = -1  # -1 means not save ckpt
     ckpt_save_dir: str = "./checkpoints"
     ckpt_load_dir: str = ""
+
+    # overlap pipeline type
+    # - none -> no overlap
+    # - native -> overlap [h2d, input dist, fwd+bwd]
+    # - prefetch -> overlap [h2d, input dist, prefetch, fwd+bwd]
     pipeline_type: str = "native"  # none, native, prefetch
 
     def __post_init__(self):
@@ -79,12 +82,13 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
     item_vocab_gpu_capacity_ratio: Optional[float] = None
 
     evict_strategy: str = "lru"
+    caching: bool = False
 
     def __post_init__(self):
         self.sharding_type = "model_parallel"
         assert self.evict_strategy.lower() in ["lru", "lfu"]
 
-    def calculate_and_reset_global_hbm_for_values(self, hidden_size):
+    def calculate_and_reset_global_hbm_for_values(self, hidden_size, multiplier=1):
         if self.global_hbm_for_values is not None:
             return
         assert (
@@ -95,7 +99,9 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
             self.item_vocab_gpu_capacity = int(
                 self.item_vocab_size_or_capacity * self.item_vocab_gpu_capacity_ratio
             )
-        self.global_hbm_for_values = self.item_vocab_gpu_capacity * hidden_size * 4
+        self.global_hbm_for_values = (
+            self.item_vocab_gpu_capacity * hidden_size * 4 * multiplier
+        )  # we assume the embedding vector storage precision is fp32
 
 
 @gin.configurable

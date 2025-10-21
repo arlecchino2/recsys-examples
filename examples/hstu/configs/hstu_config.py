@@ -69,12 +69,14 @@ class PositionEncodingConfig:
       num_position_buckets: The number of buckets used for position encoding.
       num_time_buckets: The number of buckets used for time encoding.
       use_time_encoding: A boolean flag indicating whether time encoding should be used.
+      static_max_seq_len: The static maximum length of sequence.
 
     """
 
     num_position_buckets: int
     num_time_buckets: int
     use_time_encoding: bool
+    static_max_seq_len: Optional[int] = None
 
 
 @dataclass

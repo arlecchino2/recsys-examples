@@ -92,13 +92,19 @@ def create_hstu_layer(
 @click.option(
     "--layer-type",
     type=click.Choice(_layer_type_str_to_type.keys()),
-    default="fused",
+    default="native",
     required=False,
 )
 @click.option(
     "--async-wgrad",
     type=bool,
     default=True,
+    required=False,
+)
+@click.option(
+    "--fuse-norm-mul-dropout",
+    type=bool,
+    default=False,
     required=False,
 )
 @click.option(
@@ -154,6 +160,7 @@ def run(
     num_layers,
     recompute_input_layernorm,
     recompute_input_silu,
+    fuse_norm_mul_dropout,
 ):
     log_layer_type = layer_type.upper()
     layer_type = _layer_type_str_to_type[layer_type]
@@ -173,6 +180,7 @@ def run(
         async_wgrad=async_wgrad,
         recompute_input_layernorm=recompute_input_layernorm,
         recompute_input_silu=recompute_input_silu,
+        fuse_norm_mul_dropout=fuse_norm_mul_dropout,
     )
     hstu_blocks = [
         create_hstu_layer(
@@ -236,7 +244,9 @@ def run(
         igpu_timer.stop(iteration)
 
     fwd_median_time = igpu_timer.elapsed_time(reduction="median")
-    fwd_flops = cal_flops_single_rank(hstu_config, lengths, has_bwd=False)
+    fwd_flops = cal_flops_single_rank(
+        hstu_config, lengths, num_contextuals=None, num_candidates=None, has_bwd=False
+    )
     print(
         f"[{log_layer_type}] [fwd] tokens {L};time (median): {fwd_median_time:.4f} ms;achieved flops: {fwd_flops / fwd_median_time * 1e-9:.4f} TFLOPS"
     )
@@ -250,7 +260,16 @@ def run(
         igpu_timer.stop(iteration)
 
     bwd_median_time = igpu_timer.elapsed_time(reduction="median")
-    bwd_flops = cal_flops_single_rank(hstu_config, lengths, has_bwd=True) - fwd_flops
+    bwd_flops = (
+        cal_flops_single_rank(
+            hstu_config,
+            lengths,
+            num_contextuals=None,
+            num_candidates=None,
+            has_bwd=True,
+        )
+        - fwd_flops
+    )
     print(
         f"[{log_layer_type}] [bwd] tokens {L};time (median): {bwd_median_time:.4f} ms;achieved flops: {bwd_flops / bwd_median_time * 1e-9:.4f} TFLOPS"
     )

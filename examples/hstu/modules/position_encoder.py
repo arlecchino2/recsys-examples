@@ -35,6 +35,7 @@ from typing import Optional
 
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
+from ops.triton_ops.common import set_static_max_seq_lens, set_use_runtime_max_seq_len
 from ops.triton_ops.triton_position import (  # type: ignore[attr-defined]
     triton_add_position_embeddings,
     triton_add_timestamp_positional_embeddings,
@@ -68,6 +69,7 @@ class HSTUPositionalEncoder(torch.nn.Module):
         training_dtype: torch.dtype,
         is_inference: bool = True,
         use_time_encoding: bool = True,
+        static_max_seq_len: Optional[int] = None,
     ) -> None:
         super().__init__()
         self._is_inference = is_inference
@@ -87,6 +89,10 @@ class HSTUPositionalEncoder(torch.nn.Module):
                     sqrt(1.0 / num_time_buckets),
                 ),
             )
+
+        if self._is_inference and static_max_seq_len is not None:
+            set_use_runtime_max_seq_len(False)
+            set_static_max_seq_lens(static_max_seq_len, static_max_seq_len)
 
     @output_nvtx_hook(nvtx_tag="HSTUPositionalEncoder")
     def forward(

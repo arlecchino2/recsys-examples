@@ -242,6 +242,7 @@ class HSTUBlockPreprocessor(torch.nn.Module):
                 is_inference=is_inference,
                 use_time_encoding=config.position_encoding_config.use_time_encoding,
                 training_dtype=self._training_dtype,
+                static_max_seq_len=config.position_encoding_config.static_max_seq_len,
             )
         self._is_inference = is_inference
         self._dropout_ratio = 0.0

@@ -141,12 +141,13 @@ class HSTUGpuKVCacheManager:
     ):
         self._offload_end_event.wait()
         batch_size = len(user_ids)
+        user_ids_set = set(user_ids.int().tolist())
         for idx in range(batch_size):
             user_id = user_ids[idx].item()
             start_pos = user_start_pos[idx].item()
             new_history_length = new_history_lengths[idx].item()
             self.impl.add_sequence_with_eviction(
-                user_id, start_pos, new_history_length, 1, None
+                user_id, start_pos, new_history_length, 1, None, user_ids_set
             )
 
     def evict(self, user_ids: torch.Tensor):

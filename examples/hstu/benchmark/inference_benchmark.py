@@ -80,13 +80,6 @@ def run_ranking_gr_inference():
     )
     emb_configs = [
         InferenceEmbeddingConfig(
-            feature_names=["act_feat"],
-            table_name="act",
-            vocab_size=action_vocab_size,
-            dim=hidden_dim_size,
-            use_dynamicemb=False,
-        ),
-        InferenceEmbeddingConfig(
             feature_names=["context_feat", "item_feat"]
             if max_contextual_seqlen > 0
             else ["item_feat"],
@@ -95,11 +88,19 @@ def run_ranking_gr_inference():
             dim=hidden_dim_size,
             use_dynamicemb=True,
         ),
+        InferenceEmbeddingConfig(
+            feature_names=["act_feat"],
+            table_name="act",
+            vocab_size=action_vocab_size,
+            dim=hidden_dim_size,
+            use_dynamicemb=False,
+        ),
     ]
     num_tasks = 3
     task_config = RankingConfig(
         embedding_configs=emb_configs,
-        prediction_head_arch=[[128, 10, 1] for _ in range(num_tasks)],
+        prediction_head_arch=[128, 10, 1],
+        num_tasks=num_tasks,
     )
 
     with torch.inference_mode():
@@ -136,6 +137,7 @@ def run_ranking_gr_inference():
             cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
             truncate_start_pos = cached_start_pos + cached_len
             batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
+            batch = batch.to(device=torch.cuda.current_device())
 
             model_predict.forward(batch, uids, truncate_start_pos)
 
@@ -151,6 +153,7 @@ def run_ranking_gr_inference():
             cached_start_pos, cached_len = model_predict.get_user_kvdata_info(uids)
             truncate_start_pos = cached_start_pos + cached_len
             batch = data_generator.get_random_inference_batch(uids, truncate_start_pos)
+            batch = batch.to(device=torch.cuda.current_device())
 
             torch.cuda.synchronize()
             ts_start.record()
