@@ -15,6 +15,7 @@
 import os
 import warnings
 from typing import List, Optional, Tuple, Union
+import time
 
 import torch
 import torch.distributed as dist
@@ -121,6 +122,7 @@ class InferenceRankingGR(torch.nn.Module):
         logger,
         use_cudagraph=False,
         cudagraph_configs=None,
+        enable_timing_stats=False,
     ):
         super().__init__()
         self._device = torch.cuda.current_device()
@@ -188,6 +190,16 @@ class InferenceRankingGR(torch.nn.Module):
             self._gpu_kv_cache_manager.get_kvcache_table(layer_idx)
             for layer_idx in range(hstu_config.num_layers)
         ]
+        self.enable_timing_stats = enable_timing_stats
+        if self.enable_timing_stats:
+            self.timing_stats = {
+                'forward_with_cache': {'count': 0, 'total_time': 0.0, 'step_times': {}},
+                'forward_no_cache': {'count': 0, 'total_time': 0.0, 'step_times': {}}
+            }
+        # self.timing_stats = {
+        #     'forward_with_cache': {'count': 0, 'total_time': 0.0, 'step_times': {}},
+        #     'forward_no_cache': {'count': 0, 'total_time': 0.0, 'step_times': {}}
+        # }
 
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
@@ -201,6 +213,44 @@ class InferenceRankingGR(torch.nn.Module):
                 cudagraph_configs=cudagraph_configs,
             )
 
+    def _update_timing_stats(self, method_name, timing_info):
+        """更新时间统计信息"""
+        if not self.enable_timing_stats:
+            return
+            
+        stats = self.timing_stats[method_name]
+        stats['count'] += 1
+        stats['total_time'] += timing_info['total_time']
+        
+        for step, duration in timing_info.items():
+            if step not in stats['step_times']:
+                stats['step_times'][step] = {'total': 0.0, 'count': 0}
+            stats['step_times'][step]['total'] += duration
+            stats['step_times'][step]['count'] += 1
+
+    def _print_timing_summary(self):
+        """打印时间统计摘要"""
+        if not self.enable_timing_stats:
+            return
+            
+        self.logger.info("=" * 60)
+        self.logger.info("TIMING SUMMARY")
+        self.logger.info("=" * 60)
+        
+        for method_name, stats in self.timing_stats.items():
+            if stats['count'] > 0:
+                avg_total = stats['total_time'] / stats['count']
+                self.logger.info(f"\n{method_name.upper()}:")
+                self.logger.info(f"  Total calls: {stats['count']}")
+                self.logger.info(f"  Total time: {stats['total_time']:.6f}s")
+                self.logger.info(f"  Average time per call: {avg_total:.6f}s")
+                
+                self.logger.info("  Step-wise averages:")
+                for step, step_stats in stats['step_times'].items():
+                    avg_step = step_stats['total'] / step_stats['count']
+                    percentage = (avg_step / avg_total) * 100
+                    self.logger.info(f"    {step}: {avg_step:.6f}s ({percentage:.1f}%)")
+    
     def bfloat16(self):
         """
         Convert the model to use bfloat16 precision. Only affects the dense module.
@@ -497,29 +547,55 @@ class InferenceRankingGR(torch.nn.Module):
         user_start_pos: torch.Tensor,
     ):
         with torch.inference_mode():
+            if self.enable_timing_stats:
+                start_time = time.time()
+                timing_info = {}
             user_start_pos_cuda = user_start_pos.to(
                 device=torch.cuda.current_device(), non_blocking=True
             )
+             # 1. KV缓存准备
+            if self.enable_timing_stats:
+                kv_prep_start = time.time()
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['kv_cache_preparation'] = time.time() - kv_prep_start
             # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
             # self.logger.info(f"====== After preparing kv cache ======")
             # self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
             # self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
             # self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
+            
+            # 2. Embedding计算
+            if self.enable_timing_stats:
+                emb_start = time.time()
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos
             )
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['embedding'] = time.time() - emb_start
+            
+            # 3. 预处理
+            if self.enable_timing_stats:
+                preprocess_start = time.time()
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,
                 seq_start_position=user_start_pos_cuda,
             )
-            self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
-            self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
-            self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
-            self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['preprocessing'] = time.time() - preprocess_start
+            # self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
+            # self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
+            # self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
+            # self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
 
+            # 4. HSTU推理
+            if self.enable_timing_stats:
+                hstu_start = time.time()
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
                 self._hidden_states[:num_tokens, ...].copy_(
@@ -552,7 +628,13 @@ class InferenceRankingGR(torch.nn.Module):
                     kvcache_metadata,
                 )
                 jagged_data.values = hstu_output
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['hstu_inference'] = time.time() - hstu_start
 
+            # 5. 后处理、MLP和异步offload（合并为一个时间段）
+            if self.enable_timing_stats:
+                postprocess_and_offload_start = time.time()
             self._gpu_kv_cache_manager._offload_start_event.record(
                 torch.cuda.current_stream()
             )
@@ -565,8 +647,22 @@ class InferenceRankingGR(torch.nn.Module):
             self.offload_kv_cache_wait(self._offload_states)
             self.finalize_kv_cache(user_ids)
 
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()  # 只在最后同步一次
+                timing_info['postprocess_mlp_and_offload'] = time.time() - postprocess_and_offload_start
+                timing_info['total_time'] = time.time() - start_time
+                
+                # 更新统计信息
+                self._update_timing_stats('forward_with_cache', timing_info)
+                
+                # 打印当前调用的时间信息
+                self.logger.info(f"====== Forward WITH KV Cache (Call #{self.timing_stats['forward_with_cache']['count']}) ======")
+                for step, duration in timing_info.items():
+                    self.logger.info(f"{step}: {duration:.6f}s")
+
         return jagged_item_logit
     
+
     def forward_no_cache(
         self,
         batch: Batch,
@@ -574,29 +670,41 @@ class InferenceRankingGR(torch.nn.Module):
         user_start_pos: torch.Tensor,
     ):
         with torch.inference_mode():
+            # 根据开关决定是否进行时间测量
+            if self.enable_timing_stats:
+                start_time = time.time()
+                timing_info = {}
+            
             user_start_pos_cuda = user_start_pos.to(
                 device=torch.cuda.current_device(), non_blocking=True
             )
-            kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
-            # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
-            self.logger.info(f"====== After preparing kv cache ======")
-            self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
-            self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
-            self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
+            
+            # 1. Embedding计算
+            if self.enable_timing_stats:
+                emb_start = time.time()
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos
             )
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['embedding'] = time.time() - emb_start
+            
+            # 2. 预处理
+            if self.enable_timing_stats:
+                preprocess_start = time.time()
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,
                 seq_start_position=user_start_pos_cuda,
             )
-            # self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
-            # self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
-            # self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
-            # self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['preprocessing'] = time.time() - preprocess_start
 
+            # 3. HSTU推理
+            if self.enable_timing_stats:
+                hstu_start = time.time()
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
                 self._hidden_states[:num_tokens, ...].copy_(
@@ -612,35 +720,118 @@ class InferenceRankingGR(torch.nn.Module):
                     num_tokens,
                     self._hidden_states,
                     self._jagged_metadata,
-                    # self._kvcache_metadata,
                     False,
                 )
                 jagged_data.values = hstu_output
             else:
-                # kvcache_metadata.total_history_offsets += (
-                #     jagged_data.num_candidates_offsets
-                # )
-                # # self.offload_kv_cache_wait(self._offload_states)
                 hstu_output = self._hstu_block.predict_no_cache(
                     batch.batch_size,
                     num_tokens,
                     jagged_data.values,
                     jagged_data,
-                    # kvcache_metadata,
                     False,
                 )
                 jagged_data.values = hstu_output
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['hstu_inference'] = time.time() - hstu_start
 
-            # self._gpu_kv_cache_manager._offload_start_event.record(
-            #     torch.cuda.current_stream()
-            # )
-
+            # 4. 后处理和MLP
+            if self.enable_timing_stats:
+                postprocess_start = time.time()
             jagged_data = self._hstu_block._postprocessor(jagged_data)
             jagged_item_logit = self._mlp(jagged_data.values)
-            # self._offload_states = self.offload_kv_cache_async(
-            #     user_ids, kvcache_metadata
-            # )
-            # self.offload_kv_cache_wait(self._offload_states)
-            # self.finalize_kv_cache(user_ids)
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['postprocess_and_mlp'] = time.time() - postprocess_start
+                timing_info['total_time'] = time.time() - start_time
+                
+                # 更新统计信息
+                self._update_timing_stats('forward_no_cache', timing_info)
+                
+                # 打印当前调用的时间信息
+                self.logger.info(f"====== Forward WITHOUT KV Cache (Call #{self.timing_stats['forward_no_cache']['count']}) ======")
+                for step, duration in timing_info.items():
+                    self.logger.info(f"{step}: {duration:.6f}s")
 
         return jagged_item_logit
+    # def forward_no_cache(
+    #     self,
+    #     batch: Batch,
+    #     user_ids: torch.Tensor,
+    #     user_start_pos: torch.Tensor,
+    # ):
+    #     with torch.inference_mode():
+    #         start_time = time.time()
+    #         timing_info = {}
+    #         user_start_pos_cuda = user_start_pos.to(
+    #             device=torch.cuda.current_device(), non_blocking=True
+    #         )
+    #         # kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+    #         # # kvcache_metadata.kv_indptr, kvcache_metadata.kv_indices, kvcache_metadata.kv_last_page_len
+    #         # self.logger.info(f"====== After preparing kv cache ======")
+    #         # self.logger.info(f"kv_indptr: {kvcache_metadata.kv_indptr.detach().cpu().numpy()}")
+    #         # self.logger.info(f"kv_indices: {kvcache_metadata.kv_indices.detach().cpu().numpy()}")
+    #         # self.logger.info(f"kv_last_page_len: {kvcache_metadata.kv_last_page_len.detach().cpu().numpy()}")
+    #         emb_start = time.time()
+    #         embeddings = self._embedding_collection(batch.features)
+    #         embeddings, batch = self.strip_contextual_features(
+    #             embeddings, batch, user_start_pos
+    #         )
+    #         jagged_data = self._hstu_block._preprocessor(
+    #             embeddings=embeddings,
+    #             batch=batch,
+    #             seq_start_position=user_start_pos_cuda,
+    #         )
+    #         # self.logger.info(f"jagged_data.values: {jagged_data.values.shape}")
+    #         # self.logger.info(f"jagged_data.seqlen: {jagged_data.seqlen.detach().cpu().numpy()}")
+    #         # self.logger.info(f"jagged_data.num_candidates_offsets: {jagged_data.num_candidates_offsets.detach().cpu().numpy()}")
+    #         # self.logger.info(f"jagged_data.contextual_seqlen: {jagged_data.contextual_seqlen.detach().cpu().numpy() if jagged_data.contextual_seqlen is not None else None}")
+
+    #         num_tokens = batch.features.values().shape[0]
+    #         if self.use_cudagraph:
+    #             self._hidden_states[:num_tokens, ...].copy_(
+    #                 jagged_data.values, non_blocking=True
+    #             )
+    #             copy_jagged_metadata(self._jagged_metadata, jagged_data)
+    #             self._kvcache_metadata.total_history_offsets += (
+    #                 self._jagged_metadata.num_candidates_offsets
+    #             )
+
+    #             hstu_output = self._hstu_block.predict_no_cache(
+    #                 batch.batch_size,
+    #                 num_tokens,
+    #                 self._hidden_states,
+    #                 self._jagged_metadata,
+    #                 # self._kvcache_metadata,
+    #                 False,
+    #             )
+    #             jagged_data.values = hstu_output
+    #         else:
+    #             # kvcache_metadata.total_history_offsets += (
+    #             #     jagged_data.num_candidates_offsets
+    #             # )
+    #             # # self.offload_kv_cache_wait(self._offload_states)
+    #             hstu_output = self._hstu_block.predict_no_cache(
+    #                 batch.batch_size,
+    #                 num_tokens,
+    #                 jagged_data.values,
+    #                 jagged_data,
+    #                 # kvcache_metadata,
+    #                 False,
+    #             )
+    #             jagged_data.values = hstu_output
+
+    #         # self._gpu_kv_cache_manager._offload_start_event.record(
+    #         #     torch.cuda.current_stream()
+    #         # )
+
+    #         jagged_data = self._hstu_block._postprocessor(jagged_data)
+    #         jagged_item_logit = self._mlp(jagged_data.values)
+    #         # self._offload_states = self.offload_kv_cache_async(
+    #         #     user_ids, kvcache_metadata
+    #         # )
+    #         # self.offload_kv_cache_wait(self._offload_states)
+    #         # self.finalize_kv_cache(user_ids)
+
+    #     return jagged_item_logit

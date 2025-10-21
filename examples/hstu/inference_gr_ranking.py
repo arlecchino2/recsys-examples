@@ -364,7 +364,7 @@ def run_ranking_gr_simulate(
                                 eval_metric_dict, prefix="Metrics", sep="\n    "
                             )
                         )
-                    model.clear_kv_cache()
+                    # model.clear_kv_cache()
                     cur_date = dates[0]
                     if cur_date == 20220409:
                         break
