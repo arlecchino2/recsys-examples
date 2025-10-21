@@ -33,3 +33,5 @@ embedding_checkpoint/
 pcie_lookup_poc/*
 tensorrt-llm-kvcache/
 inference_gr_ranking_without_kv.py
+third_party/
+.s3cfg
