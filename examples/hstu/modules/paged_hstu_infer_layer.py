@@ -18,6 +18,10 @@ import torch
 import torch.nn.functional as F
 from configs import InferenceHSTUConfig, KVCacheConfig
 from modules.jagged_data import JaggedData
+from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
+from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
+from ops.triton_ops.triton_layer_norm import triton_weighted_layer_norm_fwd
+from ops.triton_ops.triton_norm_mul_dropout import triton_layer_norm_mul_dropout_fwd
 
 
 class PagedHSTUInferLayer(torch.nn.Module):
@@ -123,6 +127,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
         for param in self._linear_proj.parameters():
             param.requires_grad = False
             param.copy_(torch.randn_like(param))
+        self._linear_proj_weight = self._linear_proj.weight.T.contiguous()
 
         # output buffer
         max_num_tokens = kv_cache_config.max_batch_size * kv_cache_config.max_seq_len
@@ -143,7 +148,102 @@ class PagedHSTUInferLayer(torch.nn.Module):
             requires_grad=False,
         )
 
-    def layer_output(self, num_tokens):
+        sm = torch.cuda.get_device_properties(0).major
+        if sm == 8:
+            self.addmm_silu_impl = triton_addmm_silu_fwd
+        elif sm == 9:
+            self.addmm_silu_impl = torch_addmm_silu_fwd
+        else:
+            raise ValueError(f"Unsupported SM major version: {sm}")
+
+    def uvqk_addmm_impl(self, input_data, num_tokens):
+        if num_tokens >= 2048:  # fusion impl
+            _, silu_output_data = self.addmm_silu_impl(
+                x=input_data,
+                w=self._linear_uvqk_weight,  # transposed
+                y=self._linear_uvqk.bias,
+                silu=True,
+            )
+        else:  # non fusion impl
+            silu_output_data = self._linear_uvqk(input_data)
+            F.silu(silu_output_data, inplace=True)
+
+        return silu_output_data
+
+    def uvqk_addmm_inplace_impl(self, input_data, silu_output_data, num_tokens):
+        if num_tokens >= 1024:  # fusion impl
+            self.addmm_silu_impl(
+                x=input_data,
+                w=self._linear_uvqk_weight,  # transposed
+                y=self._linear_uvqk.bias,
+                silu=True,
+                keep_unfused_out=False,
+                silu_out=silu_output_data,
+            )
+        else:  # non fusion impl
+            torch.addmm(
+                self._linear_uvqk.bias,
+                input_data,
+                self._linear_uvqk_weight,
+                out=silu_output_data,
+            )
+            F.silu(silu_output_data, inplace=True)
+
+    def proj_addmm_impl(self, input_data, residual, num_tokens):
+        if num_tokens >= 2048:  # fusion impl
+            output_data, _ = self.addmm_silu_impl(
+                x=input_data,
+                w=self._linear_proj_weight,  # transposed
+                y=residual,
+                silu=False,
+            )
+        else:  # non fusion impl
+            output_data = self._linear_proj(input_data)
+            torch.add(output_data, residual, out=output_data)
+
+            # output_data = torch.addmm(residual, input_data, self._linear_proj_weight)
+
+        return output_data
+
+    def proj_addmm_inplace_impl(self, input_data, residual, output_data, num_tokens):
+        if num_tokens >= 1024:  # fusion impl
+            self.addmm_silu_impl(
+                x=input_data,
+                w=self._linear_proj_weight,  # transposed
+                y=residual,
+                silu=False,
+                out=output_data,
+            )
+        else:  # non fusion impl
+            torch.add(self._linear_proj(input_data), residual, out=output_data)
+
+            # output_data = torch.addmm(residual, input_data, self._linear_proj_weight)
+
+        return output_data
+
+    def norm_mul_impl(self, jagged_attn_output, user, enable_fusion):
+        if enable_fusion:  # fusion impl
+            parallel_input, _, _, _, _, _ = triton_layer_norm_mul_dropout_fwd(
+                x=jagged_attn_output,
+                u=user,
+                weight=self._output_layernorm_weight,
+                bias=self._output_layernorm_bias,
+                eps=self._eps,
+                dropout_ratio=0.0,
+                training=False,
+            )
+        else:  # non fusion impl
+            parallel_input = user * F.layer_norm(
+                jagged_attn_output,
+                normalized_shape=[self._num_heads * self._linear_dim_per_head],
+                weight=self._output_layernorm_weight,
+                bias=self._output_layernorm_bias,
+                eps=self._eps,
+            )
+
+        return parallel_input
+
+    def layer_output(num_tokens):
         return self.output_buffer_[:num_tokens, ...]
 
     def load_variable(
@@ -168,7 +268,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
             eps=self._eps,
         )
 
-        mixed_uvqk = F.silu(self._linear_uvqk(normed_input))
+        mixed_uvqk = self.uvqk_addmm_impl(normed_input, num_tokens)
         (user, value, query, key) = torch.split(
             mixed_uvqk,
             self._split_arg_list,
@@ -219,24 +319,21 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_offsets=kv_cache_metadata.kv_indptr,
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
-            seq_offsets_t=jd.num_candidates_offsets,
+            cu_seqlens_t=jd.num_candidates_offsets,
         )
 
         jagged_attn_output = jagged_attn_output.view(
             -1, self._num_heads * self._linear_dim_per_head
         )
-        parallel_input = user * F.layer_norm(
-            jagged_attn_output,
-            normalized_shape=[self._num_heads * self._linear_dim_per_head],
-            weight=self._output_layernorm_weight,
-            bias=self._output_layernorm_bias,
-            eps=self._eps,
+
+        parallel_input = self.norm_mul_impl(
+            jagged_attn_output, user, num_tokens >= 2048
         )
 
-        layer_output = self._linear_proj(parallel_input)
         if self._residual:
-            torch.add(layer_output, layer_input, out=layer_output)
-
+            layer_output = self.proj_addmm_impl(parallel_input, layer_input, num_tokens)
+        else:
+            layer_output = self._linear_proj(parallel_input)
         return layer_output
     
     @torch.inference_mode()
@@ -336,21 +433,16 @@ class PagedHSTUInferLayer(torch.nn.Module):
         kv_cache_metadata,
     ) -> JaggedData:
         input_tensor = input_buffer[:num_tokens, ...]
-        normed_input = F.layer_norm(
-            input_tensor,
-            normalized_shape=[self._embedding_dim],
+        normed_input, _, _, _, _ = triton_weighted_layer_norm_fwd(
+            x=input_tensor,
             weight=self._input_layernorm_weight,
             bias=self._input_layernorm_bias,
             eps=self._eps,
         )
 
-        torch.addmm(
-            self._linear_uvqk.bias,
-            normed_input,
-            self._linear_uvqk_weight,
-            out=self.uvqk_buffer_[:num_tokens, ...],
+        self.uvqk_addmm_inplace_impl(
+            normed_input, self.uvqk_buffer_[:num_tokens, ...], num_tokens
         )
-        F.silu(self.uvqk_buffer_[:num_tokens, ...], inplace=True)
         (user, value, query, key) = torch.split(
             self.uvqk_buffer_[:num_tokens, ...],
             self._split_arg_list,
@@ -421,25 +513,20 @@ class PagedHSTUInferLayer(torch.nn.Module):
             page_offsets=kv_cache_metadata.kv_indptr,
             page_ids=kv_cache_metadata.kv_indices,
             last_page_lens=kv_cache_metadata.kv_last_page_len,
-            seq_offsets_t=jd.num_candidates_offsets[: batch_size + 1],
+            cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1],
         )
 
         jagged_attn_output = jagged_attn_output.view(
             -1, self._num_heads * self._linear_dim_per_head
         )
-        parallel_input = user * F.layer_norm(
-            jagged_attn_output,
-            normalized_shape=[self._num_heads * self._linear_dim_per_head],
-            weight=self._output_layernorm_weight,
-            bias=self._output_layernorm_bias,
-            eps=self._eps,
-        )
+        parallel_input = self.norm_mul_impl(jagged_attn_output, user, True)
 
         if self._residual:
-            torch.add(
-                self._linear_proj(parallel_input),
+            self.proj_addmm_inplace_impl(
+                parallel_input,
                 input_buffer[:num_tokens, ...],
-                out=self.output_buffer_[:num_tokens, ...],
+                self.output_buffer_[:num_tokens, ...],
+                num_tokens,
             )
         else:
             self.output_buffer_[:num_tokens, ...] = self._linear_proj(parallel_input)

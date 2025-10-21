@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTables
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DTYPE_NUM_BYTES,
@@ -27,11 +27,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     get_optimizer_state_dim,
 )
-from dynamicemb.optimizer import (
-    EmbOptimType,
-    convert_optimizer_type,
-    string_to_opt_type,
-)
+from dynamicemb.optimizer import convert_optimizer_type, string_to_opt_type
 from dynamicemb_extensions import OptimizerType
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn
@@ -152,7 +148,7 @@ def get_state_dict(
 
 
 def _gen_named_parameters_by_table_fused(
-    emb_module: BatchedDynamicEmbeddingTables,
+    emb_module: BatchedDynamicEmbeddingTablesV2,
     table_name_to_count: Dict[str, int],
     config: GroupedEmbeddingConfig,
     pg: Optional[dist.ProcessGroup] = None,
@@ -190,7 +186,7 @@ def _gen_named_parameters_by_table_fused(
 class DynamicEmbeddingFusedOptimizer(FusedOptimizer):
     def __init__(  # noqa C901
         self,
-        emb_module: BatchedDynamicEmbeddingTables,
+        emb_module: BatchedDynamicEmbeddingTablesV2,
         lr: float,
     ) -> None:
         state: Dict[Any, Any] = {}
@@ -245,7 +241,7 @@ def _get_dynamicemb_options_per_table(
     local_row,
     local_col,
     data_type: DataType,
-    optimizer: EmbOptimType,
+    optimizer: OptimizerType,
     table: ShardedEmbeddingTable,
 ) -> DynamicEmbTableOptions:
     # User-configured
@@ -257,7 +253,7 @@ def _get_dynamicemb_options_per_table(
     if dynamicemb_options.embedding_dtype is None:
         dynamicemb_options.embedding_dtype = data_type_to_dtype(data_type)
     if dynamicemb_options.training:
-        dynamicemb_options.optimizer_type = convert_optimizer_type(optimizer)
+        dynamicemb_options.optimizer_type = optimizer
     else:
         dynamicemb_options.optimizer_type = OptimizerType.Null
     dynamicemb_options.dim = local_col
@@ -280,6 +276,11 @@ def _get_dynamicemb_options_per_table(
         )
     else:
         dynamicemb_options.max_capacity = local_row
+
+    if dynamicemb_options.init_capacity is not None:
+        dynamicemb_options.max_capacity = max(
+            dynamicemb_options.max_capacity, dynamicemb_options.init_capacity
+        )
 
     return dynamicemb_options
 
@@ -313,20 +314,24 @@ class BatchedDynamicEmbeddingBag(
                     local_row,
                     local_col,
                     config.data_type,
-                    config.fused_params["optimizer"],
+                    convert_optimizer_type(config.fused_params["optimizer"])
+                    if "optimizer" in config.fused_params
+                    else OptimizerType.Null,
                     table,
                 )
             )
 
         fused_params = config.fused_params or {}
 
-        self._emb_module: BatchedDynamicEmbeddingTables = BatchedDynamicEmbeddingTables(
-            table_options=dynamicemb_options_list,
-            pooling_mode=pooling_mode_to_dynamicemb(self._pooling),
-            feature_table_map=self._feature_table_map,
-            table_names=[t.name for t in config.embedding_tables],
-            device=device,
-            **fused_params,
+        self._emb_module: BatchedDynamicEmbeddingTablesV2 = (
+            BatchedDynamicEmbeddingTablesV2(
+                table_options=dynamicemb_options_list,
+                pooling_mode=pooling_mode_to_dynamicemb(self._pooling),
+                feature_table_map=self._feature_table_map,
+                table_names=[t.name for t in config.embedding_tables],
+                device=device,
+                **fused_params,
+            )
         )
 
         if "learning_rate" in fused_params:
@@ -348,7 +353,7 @@ class BatchedDynamicEmbeddingBag(
     @property
     def emb_module(
         self,
-    ) -> BatchedDynamicEmbeddingTables:
+    ) -> BatchedDynamicEmbeddingTablesV2:
         return self._emb_module
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
@@ -424,20 +429,24 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
                     local_row,
                     local_col,
                     config.data_type,
-                    config.fused_params["optimizer"],
+                    convert_optimizer_type(config.fused_params["optimizer"])
+                    if "optimizer" in config.fused_params
+                    else OptimizerType.Null,
                     table,
                 )
             )
 
         fused_params = config.fused_params or {}
 
-        self._emb_module: BatchedDynamicEmbeddingTables = BatchedDynamicEmbeddingTables(
-            table_options=dynamicemb_options_list,
-            pooling_mode=DynamicEmbPoolingMode.NONE,
-            feature_table_map=self._feature_table_map,
-            table_names=[t.name for t in config.embedding_tables],
-            device=device,
-            **fused_params,
+        self._emb_module: BatchedDynamicEmbeddingTablesV2 = (
+            BatchedDynamicEmbeddingTablesV2(
+                table_options=dynamicemb_options_list,
+                pooling_mode=DynamicEmbPoolingMode.NONE,
+                feature_table_map=self._feature_table_map,
+                table_names=[t.name for t in config.embedding_tables],
+                device=device,
+                **fused_params,
+            )
         )
 
         if "learning_rate" in fused_params:
@@ -458,7 +467,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
     @property
     def emb_module(
         self,
-    ) -> BatchedDynamicEmbeddingTables:
+    ) -> BatchedDynamicEmbeddingTablesV2:
         return self._emb_module
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.

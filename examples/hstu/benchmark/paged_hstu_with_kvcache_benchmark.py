@@ -105,13 +105,6 @@ def benchmark_model(
     )
     emb_configs = [
         InferenceEmbeddingConfig(
-            feature_names=[_action_fea_name],
-            table_name="t_" + _action_fea_name,
-            vocab_size=_action_vocab_size,
-            dim=embedding_dim,
-            use_dynamicemb=False,
-        ),
-        InferenceEmbeddingConfig(
             feature_names=_context_fea_names + [_item_fea_name]
             if max_contextual_seqlen > 0
             else [_item_fea_name],
@@ -120,11 +113,19 @@ def benchmark_model(
             dim=embedding_dim,
             use_dynamicemb=True,
         ),
+        InferenceEmbeddingConfig(
+            feature_names=[_action_fea_name],
+            table_name="t_" + _action_fea_name,
+            vocab_size=_action_vocab_size,
+            dim=embedding_dim,
+            use_dynamicemb=False,
+        ),
     ]
     num_tasks = 3
     task_config = RankingConfig(
         embedding_configs=emb_configs,
-        prediction_head_arch=[[128, 10, 1] for _ in range(num_tasks)],
+        prediction_head_arch=[128, 10, 1],
+        num_tasks=num_tasks,
     )
     bench_model = InferenceRankingGR(
         hstu_config=hstu_config,

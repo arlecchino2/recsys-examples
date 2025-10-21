@@ -202,6 +202,7 @@ def _addmm_optional_silu_fwd(
     ALLOW_TF32: tl.constexpr,
     BROADCAST_Y: tl.constexpr,
     SILU: tl.constexpr,
+    KEEP_UNFUSED_OUT: tl.constexpr,
 ):
     pid_0, pid_1 = tl.program_id(axis=0), tl.program_id(axis=1)
     pid = pid_0 * tl.num_programs(axis=1) + pid_1
@@ -250,9 +251,10 @@ def _addmm_optional_silu_fwd(
         y = tl.load(y_ptrs, mask=z_mask)
     z = accumulator + y.to(tl.float32)
 
-    z_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_zm
-    z_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_zn
-    z_ptrs = z_ptr + stride_zm * offs_m[:, None] + stride_zn * offs_n[None, :]
+    if KEEP_UNFUSED_OUT:
+        z_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_zm
+        z_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_zn
+        z_ptrs = z_ptr + stride_zm * offs_m[:, None] + stride_zn * offs_n[None, :]
 
     if SILU:
         silu_z_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_zm
@@ -266,7 +268,8 @@ def _addmm_optional_silu_fwd(
             silu_z_ptr.dtype.element_ty
         )
         tl.store(silu_z_ptrs, silu_z, mask=z_mask)
-    tl.store(z_ptrs, z.to(z_ptr.dtype.element_ty), mask=z_mask)
+    if KEEP_UNFUSED_OUT:
+        tl.store(z_ptrs, z.to(z_ptr.dtype.element_ty), mask=z_mask)
 
 
 def triton_addmm_silu_bwd(
@@ -308,6 +311,9 @@ def triton_addmm_silu_fwd(
     w: torch.Tensor,
     y: torch.Tensor,
     silu: bool = False,
+    keep_unfused_out: bool = True,
+    out: torch.Tensor = None,
+    silu_out: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     M, K = x.shape
     KB, N = w.shape
@@ -318,9 +324,17 @@ def triton_addmm_silu_fwd(
     assert N == NY, f"incompatible dimensions {N}, {NY}"
 
     # Allocate output
-    z = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    if out is None and silu_out is None:
+        z = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    elif out is None and keep_unfused_out:
+        z = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    else:
+        z = out if out is not None else silu_out
     if silu:
-        silu_z = torch.empty_like(z)
+        if silu_out is None:
+            silu_z = torch.empty_like(z)
+        else:
+            silu_z = silu_out
     else:
         silu_z = None
 
@@ -351,6 +365,7 @@ def triton_addmm_silu_fwd(
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         BROADCAST_Y=is_y_1d,
         SILU=silu,
+        KEEP_UNFUSED_OUT=keep_unfused_out,
     )
     return z, silu_z
 

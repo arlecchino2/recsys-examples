@@ -31,10 +31,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     EmbOptimType,
 )
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTables,
-    BatchedDynamicEmbeddingTablesV2,
-)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import KeyValueTable
 from dynamicemb_extensions import DynamicEmbTable, insert_or_assign
 from fbgemm_gpu.runtime_monitor import StdLogStatsReporterConfig
@@ -173,12 +170,6 @@ def parse_args():
         default=0.125,
         help="cache how many embeddings to HBM",
     )
-    parser.add_argument(
-        "--table_version",
-        type=int,
-        default=1,
-        help="Table Version",
-    )
 
     parser.add_argument("--learning_rate", type=float, default=0.1)
     parser.add_argument("--eps", type=float, default=1e-3, help="Learning rate.")
@@ -188,11 +179,11 @@ def parse_args():
 
     args = parser.parse_args()
     args.num_embeddings_per_feature = [
-        int(v) * 1024 * 1024 for v in args.num_embeddings_per_feature.split(",")
+        int(float(v) * 1024 * 1024) for v in args.num_embeddings_per_feature.split(",")
     ]
     args.num_embedding_table = len(args.num_embeddings_per_feature)
     args.hbm_for_embeddings = [
-        int(v) * (1024**3) for v in args.hbm_for_embeddings.split(",")
+        int(float(v) * (1024**3)) for v in args.hbm_for_embeddings.split(",")
     ]
 
     return args
@@ -355,45 +346,24 @@ def create_dynamic_embedding_tables(args, device):
     table_options = []
     table_num = args.num_embedding_table
     for i in range(table_num):
-        if args.table_version == 1:
-            TableModule = BatchedDynamicEmbeddingTables
-            table_options.append(
-                DynamicEmbTableOptions(
-                    index_type=torch.int64,
-                    embedding_dtype=get_emb_precision(args.emb_precision),
-                    dim=args.embedding_dim,
-                    max_capacity=args.num_embeddings_per_feature[i],
-                    local_hbm_for_values=args.hbm_for_embeddings[i],
-                    bucket_capacity=128,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.NORMAL,
-                    ),
-                    score_strategy=DynamicEmbScoreStrategy.LFU
-                    if args.cache_algorithm == "lfu"
-                    else DynamicEmbScoreStrategy.TIMESTAMP,
-                )
+        TableModule = BatchedDynamicEmbeddingTablesV2
+        table_options.append(
+            DynamicEmbTableOptions(
+                index_type=torch.int64,
+                embedding_dtype=get_emb_precision(args.emb_precision),
+                dim=args.embedding_dim,
+                max_capacity=args.num_embeddings_per_feature[i],
+                local_hbm_for_values=args.hbm_for_embeddings[i],
+                bucket_capacity=128,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.NORMAL,
+                ),
+                score_strategy=DynamicEmbScoreStrategy.LFU
+                if args.cache_algorithm == "lfu"
+                else DynamicEmbScoreStrategy.TIMESTAMP,
+                caching=args.caching,
             )
-        elif args.table_version == 2:
-            TableModule = BatchedDynamicEmbeddingTablesV2
-            table_options.append(
-                DynamicEmbTableOptions(
-                    index_type=torch.int64,
-                    embedding_dtype=get_emb_precision(args.emb_precision),
-                    dim=args.embedding_dim,
-                    max_capacity=args.num_embeddings_per_feature[i],
-                    local_hbm_for_values=args.hbm_for_embeddings[i],
-                    bucket_capacity=128,
-                    initializer_args=DynamicEmbInitializerArgs(
-                        mode=DynamicEmbInitializerMode.NORMAL,
-                    ),
-                    score_strategy=DynamicEmbScoreStrategy.LFU
-                    if args.cache_algorithm == "lfu"
-                    else DynamicEmbScoreStrategy.TIMESTAMP,
-                    caching=args.caching,
-                )
-            )
-        else:
-            raise ValueError("Not support table version")
+        )
 
     var = TableModule(
         table_options=table_options,
@@ -411,7 +381,7 @@ def create_dynamic_embedding_tables(args, device):
     )
 
     for table_id in range(table_num):
-        cur_table = TableShim(var.tables[table_id])
+        cur_table = var.tables[table_id]
 
         num_embeddings = args.num_embeddings_per_feature[table_id]
         fill_batch = 1024 * 1024
@@ -428,8 +398,8 @@ def create_dynamic_embedding_tables(args, device):
                 dtype=torch.float32,
             )
 
-            optstate_dim = cur_table.optim_states_dim()
-            initial_accumulator = cur_table.init_optim_state()
+            optstate_dim = cur_table.optim_state_dim()
+            initial_accumulator = cur_table.init_optimizer_state()
             optstate = (
                 torch.rand(
                     unique_values.size(0),
@@ -448,7 +418,7 @@ def create_dynamic_embedding_tables(args, device):
                 if args.cache_algorithm == "lfu"
                 else None
             )
-            cur_table.insert(n, unique_indices, unique_values, scores)
+            cur_table.insert(unique_indices, unique_values, scores)
 
     return var
 
@@ -495,7 +465,9 @@ def create_split_table_batched_embeddings(args, device):
                 (
                     e,
                     D,
-                    EmbeddingLocation.MANAGED,
+                    EmbeddingLocation.MANAGED
+                    if abs(args.gpu_ratio - 1.0) > 1e-3
+                    else EmbeddingLocation.DEVICE,
                     ComputeDevice.CUDA,
                 )
                 for e in Es
@@ -513,6 +485,7 @@ def create_split_table_batched_embeddings(args, device):
             beta2=args.beta2,
             bounds_check_mode=BoundsCheckMode.NONE,
         ).cuda()
+        print(f"torchrec table 's specs={emb.embedding_specs[0]}")
     return emb
 
 
@@ -627,6 +600,7 @@ def input_distribution(tensor_list, n, max_val, batch_size):
     return num_equal, (num_equal / unique_vals.size(0)) * 100
 
 
+# there is a illegal memory access issue when capacity=256M or embedding_dim=256(capacity=128M) when warmup
 def warmup_tables(tensor_list, n, max_val, batch_size, dynamic_emb, torchrec_emb):
     counts = torch.zeros(
         max_val + 1, dtype=torch.long, device=tensor_list[0].values().device
@@ -655,6 +629,66 @@ def clear_cache(args, dynamic_emb, torchrec_emb):
     assert args.caching
     dynamic_emb.reset_cache_states()
     torchrec_emb.reset_cache_states()
+
+
+def find_max_tensor(remain_GB, dtype=torch.float32):
+    safe_margin = 0.95
+    device = torch.cuda.current_device()
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    reserved_mem = torch.cuda.memory_reserved(device)
+    current_free = total_mem - reserved_mem
+
+    target_free_bytes = remain_GB * 1024**3
+    alloc_bytes = int(current_free * safe_margin - target_free_bytes)
+    if alloc_bytes <= 0:
+        print(f"No enough memory to remain {remain_GB} GB")
+        return 0
+
+    bytes_per_element = torch.tensor([], dtype=dtype).element_size()
+    max_elements = alloc_bytes // bytes_per_element
+
+    # binary search to get max safe allocate size, avoid fragment and OOM
+    left, right, result = 0, max_elements, 0
+    while left <= right:
+        mid = (left + right) // 2
+        try:
+            t = torch.empty(mid, dtype=dtype, device="cuda")
+            del t
+            result = mid
+            left = mid + 1
+        except RuntimeError:
+            right = mid - 1
+    print(
+        f"Max tensor size can be allocated：{result * bytes_per_element/1024**3:.2f} GB，total {result} elements."
+    )
+    return result
+
+
+def occupy_gpu_memory(remain=20):
+    target_free_GB = remain
+    if not torch.cuda.is_available():
+        print("CUDA is not available.")
+        return None
+
+    device = torch.cuda.current_device()
+    total_mem = torch.cuda.get_device_properties(device).total_memory
+    reserved_mem = torch.cuda.memory_reserved(device)
+    current_free = total_mem - reserved_mem
+    current_free_GB = current_free / (1024**3)
+    print(f"GPU memory remain: {current_free_GB:.2f} GB")
+
+    if current_free_GB > target_free_GB:
+        max_elements = find_max_tensor(remain_GB=target_free_GB, dtype=torch.float32)
+        if max_elements > 0:
+            t = torch.empty(max_elements, dtype=torch.float32, device="cuda")
+            allocated_GB = max_elements * t.element_size() / 1024**3
+            print(
+                f"Occupy gpu memory: {allocated_GB:.2f} GB，remain around {target_free_GB} GB"
+            )
+            return t
+
+    print(f"The remained gpu memory less than {target_free_GB} GB")
+    return None
 
 
 @record
@@ -698,8 +732,19 @@ def main():
     if args.caching:
         var.set_record_cache_metrics(True)
         clear_cache(args, var, torchrec_emb)
+        # warmup_tables(
+        #     sparse_features,
+        #     int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
+        #     args.num_embeddings_per_feature[0],
+        #     args.batch_size,
+        #     var,
+        #     torchrec_emb,
+        # )
 
-    warmup_gpu(device)
+    # warmup_gpu(device)
+    # torch.cuda.empty_cache()
+
+    # placeholder = occupy_gpu_memory()
     for i in range(0, args.num_iterations, report_interval):
         for j in range(report_interval):
             (
@@ -752,15 +797,24 @@ def main():
         var.set_record_cache_metrics(False)
         torchrec_emb.record_cache_metrics = RecordCacheMetrics(False, False)
         clear_cache(args, var, torchrec_emb)
+        # warmup_tables(
+        #     sparse_features,
+        #     int(args.gpu_ratio * args.num_embeddings_per_feature[0]),
+        #     args.num_embeddings_per_feature[0],
+        #     args.batch_size,
+        #     var,
+        #     torchrec_emb,
+        # )
 
     torch.cuda.profiler.start()
     dynamicemb_res = benchmark_train_eval(var, sparse_features, timer, args)
     torchrec_res = benchmark_train_eval(torchrec_emb, sparse_features, timer, args)
     torch.cuda.profiler.stop()
 
+    # print(placeholder.numel())
+
     test_result = {
         "caching": args.caching,
-        "table_version": args.table_version,
         "batch_size": args.batch_size,
         "num_embeddings_per_feature": args.num_embeddings_per_feature,
         "hbm_for_embeddings": args.hbm_for_embeddings,

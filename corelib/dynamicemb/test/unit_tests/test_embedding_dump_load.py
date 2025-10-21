@@ -60,6 +60,17 @@ def get_optimizer_kwargs(optimizer_type: str) -> Dict[str, Any]:
         raise ValueError("unknown optimizer type")
 
 
+def get_score_strategy(score_strategy_str: str) -> DynamicEmbScoreStrategy:
+    if score_strategy_str == "timestamp":
+        return DynamicEmbScoreStrategy.TIMESTAMP
+    elif score_strategy_str == "step":
+        return DynamicEmbScoreStrategy.STEP
+    elif score_strategy_str == "lfu":
+        return DynamicEmbScoreStrategy.LFU
+    else:
+        raise ValueError(f"Invalid score strategy: {score_strategy_str}")
+
+
 def generate_sparse_feature(
     num_embedding_collections: int,
     num_embeddings: List[int],
@@ -133,7 +144,7 @@ def apply_dmp(
     model: torch.nn.Module,
     optimizer_kwargs: Dict[str, Any],
     device: torch.device,
-    score_strategy: DynamicEmbScoreStrategy = DynamicEmbScoreStrategy.STEP,
+    score_strategy: DynamicEmbScoreStrategy,
 ):
     eb_configs = []
     dynamicemb_options_dict = {}
@@ -196,6 +207,7 @@ def create_model(
     num_embeddings: List[int],
     embedding_dim: int,
     optimizer_kwargs: Dict[str, Any],
+    score_strategy: DynamicEmbScoreStrategy,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -224,7 +236,10 @@ def create_model(
     )
 
     model = apply_dmp(
-        model, optimizer_kwargs, torch.device(f"cuda:{torch.cuda.current_device()}")
+        model,
+        optimizer_kwargs,
+        torch.device(f"cuda:{torch.cuda.current_device()}"),
+        score_strategy,
     )
     return model
 
@@ -241,14 +256,22 @@ def create_model(
     required=True,
 )
 @click.option("--mode", type=click.Choice(["load", "dump"]), required=True)
+@click.option(
+    "--score-strategy",
+    type=click.Choice(["timestamp", "step", "lru", "lfu"]),
+    required=True,
+)
+@click.option("--optim", type=bool, required=True)
 def test_model_load_dump(
     num_embedding_collections: int,
     num_embeddings: str,
     multi_hot_sizes: str,
     embedding_dim: int,
     optimizer_type: str,
+    score_strategy: str,
     mode: str,
     save_path: str,
+    optim: bool,
     batch_size: int = 128,
     num_iterations: int = 10,
 ):
@@ -262,11 +285,14 @@ def test_model_load_dump(
             )
 
     optimizer_kwargs = get_optimizer_kwargs(optimizer_type)
+    score_strategy_ = get_score_strategy(score_strategy)
+
     ref_model = create_model(
         num_embedding_collections=num_embedding_collections,
         num_embeddings=num_embeddings,
         embedding_dim=embedding_dim,
         optimizer_kwargs=optimizer_kwargs,
+        score_strategy=score_strategy_,
     )
 
     kjts = generate_sparse_feature(
@@ -288,7 +314,7 @@ def test_model_load_dump(
 
     if mode == "dump":
         shutil.rmtree(save_path, ignore_errors=True)
-        DynamicEmbDump(save_path, ref_model, optim=True)
+        DynamicEmbDump(save_path, ref_model, optim=optim)
 
     if mode == "load":
         model = create_model(
@@ -296,15 +322,17 @@ def test_model_load_dump(
             num_embeddings=num_embeddings,
             embedding_dim=embedding_dim,
             optimizer_kwargs=optimizer_kwargs,
+            score_strategy=score_strategy_,
         )
 
-        DynamicEmbLoad(save_path, model, optim=True)
+        DynamicEmbLoad(save_path, model, optim=optim)
 
-        for kjt in kjts:
-            ret = model(kjt)
-            ret.sum().backward()
-            ref_ret = ref_model(kjt)
-            ref_ret.sum().backward()
+        if optim:
+            for kjt in kjts:
+                ret = model(kjt)
+                ret.sum().backward()
+                ref_ret = ref_model(kjt)
+                ref_ret.sum().backward()
 
         ref_model = ref_model.eval()
         model = model.eval()

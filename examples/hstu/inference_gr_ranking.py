@@ -200,6 +200,7 @@ def get_inference_hstu_model(
         num_position_buckets=8192,
         num_time_buckets=2048,
         use_time_encoding=False,
+        static_max_seq_len=math.ceil(total_max_seqlen / 32) * 32,
     )
 
     hstu_config = get_inference_hstu_config(
