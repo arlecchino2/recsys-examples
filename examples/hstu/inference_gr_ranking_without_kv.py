@@ -16,12 +16,16 @@ import sys
 import os
 os.environ['NUMEXPR_MAX_THREADS'] = '256'
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+os.environ['PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT'] = '3'
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchmetrics.utilities.prints")
 
-import datetime
+import argparse
+from tqdm import tqdm
 import logging
+from datetime import datetime
+
 import argparse
 import enum
 import math
@@ -47,13 +51,15 @@ from modules.metrics import get_multi_event_metric_module
 from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
+import numpy as np
+
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
 sys.path.append("./training/")
 from gin_config_args import DatasetArgs, NetworkArgs
 
-log_dir = "newlogs/logs_10_22"
+log_dir = "newlogs/logs_10_28"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -70,6 +76,7 @@ logger.addHandler(file_handler)
 class RunningMode(enum.Enum):
     EVAL = "eval"
     SIMULATE = "simulate"
+    REGULAR = "regular"
 
     def __str__(self):
         return self.value
@@ -177,6 +184,8 @@ def get_inference_hstu_model(
     num_contextual_features,
     total_max_seqlen,
     checkpoint_dir,
+    use_cudagraph,
+    enable_timing_stats=False,
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -212,6 +221,7 @@ def get_inference_hstu_model(
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
+    print(kvcache_args["offload_chunksize"])
     kv_cache_config = get_kvcache_config(**kvcache_args)
 
     ranking_args = RankingArgs()
@@ -234,8 +244,9 @@ def get_inference_hstu_model(
         kvcache_config=kv_cache_config,
         task_config=task_config,
         logger=logger,
-        use_cudagraph=False,
+        use_cudagraph=use_cudagraph,
         cudagraph_configs=hstu_cudagraph_configs,
+        enable_timing_stats=enable_timing_stats,
     )
     if hstu_config.bf16:
         model.bfloat16()
@@ -251,6 +262,10 @@ def run_ranking_gr_simulate(
     checkpoint_dir: str,
     check_auc: bool = False,
     disable_contextual_features: bool = False,
+    inference_batch_size: int = 1,
+    use_cudagraph: bool = False,
+    use_kvcache: bool = True,
+    enable_timing_stats: bool = True,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -263,9 +278,10 @@ def run_ranking_gr_simulate(
         else 0
     )
 
-    max_batch_size = 1
+    max_batch_size = inference_batch_size
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
-    print("total_max_seqlen", total_max_seqlen)
+    # print("total_max_seqlen", total_max_seqlen)
+    logger.info(f"total_max_seqlen: {total_max_seqlen}")
 
     with torch.inference_mode():
         model = get_inference_hstu_model(
@@ -274,6 +290,8 @@ def run_ranking_gr_simulate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            use_cudagraph,
+            enable_timing_stats,
         )
 
         if check_auc:
@@ -307,9 +325,32 @@ def run_ranking_gr_simulate(
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
+        model.clear_kv_cache()
+        # time_change = 0
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
+                # count += 1
+                num_batches_ctr += 1
+                print(f'{num_batches_ctr}: {uids}')
+                # logger.info(f'{count}: {uids}')
+                
+                # 同batch内用户合并
+                uids_np = uids.cpu().numpy()
+                unique_uids_np, first_occurrence_indices_np = np.unique(uids_np, return_index=True)
+                unique_uids = torch.from_numpy(unique_uids_np).to(uids.device)
+                first_occurrence_indices = torch.from_numpy(first_occurrence_indices_np).to(uids.device)
+                merged_seq_endptrs = torch.zeros_like(unique_uids, dtype=seq_endptrs.dtype)
+                merged_seq_endptrs = merged_seq_endptrs.scatter_reduce(
+                    0, torch.unique(uids, return_inverse=True)[1], seq_endptrs, reduce="amax", include_self=False
+                )
+                merged_dates = dates[first_occurrence_indices]
+                uids = unique_uids
+                dates = merged_dates
+                seq_endptrs = merged_seq_endptrs
+
+                logger.info(f'{num_batches_ctr}: {uids}, {seq_endptrs}')
+                
                 if dates[0] != cur_date:
                     if cur_date is not None:
                         eval_metric_dict = eval_module.compute()
@@ -319,63 +360,117 @@ def run_ranking_gr_simulate(
                                 eval_metric_dict, prefix="Metrics", sep="\n    "
                             )
                         )
-                    model.clear_kv_cache()
-                    cur_date = dates[0]
-                cached_start_pos, cached_len = model.get_user_kvdata_info(
-                    uids, dbg_print=True
-                )
-                new_cache_start_pos = cached_start_pos + cached_len
-                non_contextual_mask = new_cache_start_pos >= num_contextual_features
-                contextual_mask = torch.logical_not(non_contextual_mask)
-                seq_startptrs = (
-                    torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
-                ).int()
+                    # model.clear_kv_cache()
+                    # cur_date = dates[0]
+                    if num_batches_ctr == 20220410:
+                        break
+                if use_kvcache:
+                    cached_start_pos, cached_len = model.get_user_kvdata_info(
+                        uids, dbg_print=True
+                    )
+                    logger.info(f'{num_batches_ctr}: cached_start_pos={cached_start_pos.detach().cpu().numpy()}, cached_len={cached_len.detach().cpu().numpy()}')
+                    new_cache_start_pos = cached_start_pos + cached_len
+                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                    contextual_mask = torch.logical_not(non_contextual_mask)
+                    seq_startptrs = (
+                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                    ).int()
+                else:
+                    new_cache_start_pos = torch.zeros_like(uids)
+                    logger.info(f'{num_batches_ctr}: {new_cache_start_pos}')
+                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                    contextual_mask = torch.logical_not(non_contextual_mask)
+                    seq_startptrs = (
+                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                    ).int()
 
-                batch_0 = dataset.get_input_batch(
-                    uids[non_contextual_mask],
-                    dates[non_contextual_mask],
-                    seq_endptrs[non_contextual_mask],
-                    seq_startptrs[non_contextual_mask],
-                    with_contextual_features=False,
+                # batch_0 = dataset.get_input_batch(
+                #     uids[non_contextual_mask],
+                #     dates[non_contextual_mask],
+                #     seq_endptrs[non_contextual_mask],
+                #     seq_startptrs[non_contextual_mask],
+                #     with_contextual_features=False,
+                #     with_ranking_labels=True,
+                # )
+                # if batch_0 is not None:
+                #     if use_kvcache:
+                #         logits = model.forward(
+                #             batch_0,
+                #             uids[non_contextual_mask].int(),
+                #             new_cache_start_pos[non_contextual_mask],
+                #         )
+                #     else:
+                #         logits = model.forward_no_cache(
+                #             batch_0,
+                #             uids[non_contextual_mask].int(),
+                #             new_cache_start_pos[non_contextual_mask],
+                #         )
+                #     eval_module(logits, batch_0.labels)
+
+                # batch_1 = dataset.get_input_batch(
+                #     uids[contextual_mask],
+                #     dates[contextual_mask],
+                #     seq_endptrs[contextual_mask],
+                #     seq_startptrs[contextual_mask],
+                #     with_contextual_features=True,
+                #     with_ranking_labels=True,
+                # )
+                # if batch_1 is not None:
+                #     if use_kvcache:
+                #         logits = model.forward(
+                #             batch_1,
+                #             uids[contextual_mask].int(),
+                #             new_cache_start_pos[contextual_mask],
+                #         )
+                #     else:
+                #         logits = model.forward_no_cache(
+                #             batch_1,
+                #             uids[contextual_mask].int(),
+                #             new_cache_start_pos[contextual_mask],
+                #         )
+                #     eval_module(logits, batch_1.labels)
+                batch = dataset.get_input_batch(
+                    uids,
+                    dates,
+                    seq_endptrs,
+                    seq_startptrs,
+                    with_contextual_features=contextual_mask.tolist(),  # 传入bool列表
                     with_ranking_labels=True,
                 )
-                if batch_0 is not None:
-                    logits = model.forward(
-                        batch_0,
-                        uids[non_contextual_mask].int(),
-                        new_cache_start_pos[non_contextual_mask],
-                    )
-                    eval_module(logits, batch_0.labels)
 
-                batch_1 = dataset.get_input_batch(
-                    uids[contextual_mask],
-                    dates[contextual_mask],
-                    seq_endptrs[contextual_mask],
-                    seq_startptrs[contextual_mask],
-                    with_contextual_features=True,
-                    with_ranking_labels=True,
-                )
-                if batch_1 is not None:
-                    logits = model.forward(
-                        batch_1,
-                        uids[contextual_mask].int(),
-                        new_cache_start_pos[contextual_mask],
-                    )
-                    eval_module(logits, batch_1.labels)
+                if batch is not None:
+                    if use_kvcache:
+                        logits = model.forward(
+                            batch,
+                            uids.int(),
+                            new_cache_start_pos,
+                        )
+                    else:
+                        logits = model.forward_no_cache(
+                            batch,
+                            uids.int(),
+                            new_cache_start_pos,
+                        )
+                    eval_module(logits, batch.labels)
+                if num_batches_ctr * max_batch_size >= 140000:
+                    break
 
-                print(num_batches_ctr)
-                num_batches_ctr += 1
-                if num_batches_ctr >= 10000:
-                   break
             except StopIteration:
                 break
         end_time = time.time()
         print("Total #batch:", num_batches_ctr)
         print("Total time(s):", end_time - start_time)
+        logger.info(f"Total #batch: {num_batches_ctr}")
+        logger.info(f"Total time(s): {end_time - start_time}")
+        if enable_timing_stats:
+            model._print_timing_summary()
 
 
 def run_ranking_gr_evaluate(
-    checkpoint_dir: str, disable_contextual_features: bool = False
+    checkpoint_dir: str,
+    disable_contextual_features: bool = False,
+    inference_batch_size: int = 1,
+    use_cudagraph: bool = False,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -425,6 +520,7 @@ def run_ranking_gr_evaluate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            use_cudagraph
         )
 
         eval_module = get_multi_event_metric_module(
@@ -478,6 +574,138 @@ def run_ranking_gr_evaluate(
         )
 
 
+def run_ranking_gr_regular(
+    checkpoint_dir: str,
+    check_auc: bool = False,
+    disable_contextual_features: bool = False,
+    inference_batch_size: int = 1,
+    use_cudagraph: bool = False,
+    full_mode: bool = True,
+    use_kvcache: bool = True,
+    enable_timing_stats: bool = True,
+):
+    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
+        disable_contextual_features
+    )
+
+    dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
+    num_contextual_features = (
+        len(dataproc._contextual_feature_names)
+        if not disable_contextual_features
+        else 0
+    )
+
+    max_batch_size = inference_batch_size
+    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
+    # print("total_max_seqlen", total_max_seqlen)
+    logger.info(f"total_max_seqlen: {total_max_seqlen}")
+
+    with torch.inference_mode():
+        model = get_inference_hstu_model(
+            emb_configs,
+            max_batch_size,
+            num_contextual_features,
+            total_max_seqlen,
+            checkpoint_dir,
+            use_cudagraph,
+            enable_timing_stats,
+        )
+
+        if check_auc:
+            eval_module = get_multi_event_metric_module(
+                num_classes=model._task_config.prediction_head_arch[-1],
+                num_tasks=model._task_config.num_tasks,
+                metric_types=model._task_config.eval_metrics,
+            )
+
+        dataset = InferenceDataset(
+            seq_logs_file=dataproc._inference_sequence_file,
+            batch_logs_file=dataproc._inference_batch_file,
+            batch_size=max_batch_size,
+            max_seqlen=dataset_args.max_sequence_length,
+            item_feature_name=dataproc._item_feature_name,
+            contextual_feature_names=dataproc._contextual_feature_names
+            if not disable_contextual_features
+            else [],
+            action_feature_name=dataproc._action_feature_name,
+            max_num_candidates=dataset_args.max_num_candidates,
+            item_vocab_size=10_000_000,
+            userid_name="user_id",
+            date_name="date",
+            sequence_endptr_name="interval_indptr",
+            timestamp_names=["date", "interval_end_ts"],
+            max_num_users=1024,
+            max_incremental_seqlen=64,
+            full_mode=full_mode,
+        )
+
+        num_batches_ctr = 0
+        start_time = time.time()
+        model.clear_kv_cache()
+        for iteration in range(1000):
+            try:
+                batch_data = dataset.get_regular_batch_user_ids()
+                if batch_data is None:
+                    break
+                uids, dates, seq_endptrs = batch_data
+                num_batches_ctr += 1
+                print(f'{num_batches_ctr}: {uids}')
+                logger.info(f'{iteration}: uids:{uids.detach().cpu().numpy()}')
+                
+                if use_kvcache:
+                    cached_start_pos, cached_len = model.get_user_kvdata_info(
+                        uids, dbg_print=True
+                    )
+                    new_cache_start_pos = cached_start_pos + cached_len
+                    # logger.info(f'{num_batches_ctr}: {new_cache_start_pos}')
+                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                    contextual_mask = torch.logical_not(non_contextual_mask)
+                    seq_startptrs = (
+                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                    ).int()
+                else:
+                    new_cache_start_pos = torch.zeros_like(uids)
+                    # logger.info(f'{num_batches_ctr}: {new_cache_start_pos}')
+                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                    contextual_mask = torch.logical_not(non_contextual_mask)
+                    seq_startptrs = (
+                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                    ).int()
+
+                batch = dataset.get_regular_input_batch(
+                    uids,
+                    dates,
+                    seq_endptrs,
+                    seq_startptrs,
+                    with_contextual_features=contextual_mask.tolist(),  # 传入bool列表
+                    with_ranking_labels=True,
+                )
+
+                if batch is not None:
+                    if use_kvcache:
+                        logits = model.forward(
+                            batch,
+                            uids.int(),
+                            new_cache_start_pos,
+                        )
+                    else:
+                        logits = model.forward_no_cache(
+                            batch,
+                            uids.int(),
+                            new_cache_start_pos,
+                        )
+                    eval_module(logits, batch.labels)
+
+            except StopIteration:
+                break
+        end_time = time.time()
+        print("Total #batch:", num_batches_ctr)
+        print("Total time(s):", end_time - start_time)
+        logger.info(f"Total #batch: {num_batches_ctr}")
+        logger.info(f"Total time(s): {end_time - start_time}")
+        if enable_timing_stats:
+            model._print_timing_summary()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
@@ -487,19 +715,52 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--disable_context", action="store_true")
+    parser.add_argument('--batch_size', type=int, default=1, choices=[1, 2, 4, 5, 6, 7, 8, 10, 12, 14, 16],
+                        help='Batch size for inference')
+    parser.add_argument('--gpu', type=int, default=1,
+                        help='GPU id for inference')
+    parser.add_argument('--use_kvcache', action='store_true', default=False,
+                        help='Whether to use kv_cache')
+    parser.add_argument('--use_cudagraph', action='store_true', default=False,
+                        help='Whether to use cuDagraph')
+    parser.add_argument('--enable_timing_stats', action='store_true', default=False,
+                        help='Enable detailed timing statistics')
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
+
+    torch.cuda.set_device(args.gpu)
+    device_id = torch.cuda.current_device()
+    print(f"Current device: cuda:{torch.cuda.current_device()}")
 
     if args.mode == RunningMode.EVAL:
         if args.disable_auc:
             print("disable_auc is ignored in Eval mode.")
         if args.disable_context:
             print("disable_context is ignored in Eval mode.")
-        run_ranking_gr_evaluate(checkpoint_dir=args.checkpoint_dir)
+        run_ranking_gr_evaluate(checkpoint_dir=args.checkpoint_dir,
+                                inference_batch_size=args.batch_size,
+                                use_cudagraph=args.use_cudagraph,)
     elif args.mode == RunningMode.SIMULATE:
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,
             disable_contextual_features=args.disable_context,
+            inference_batch_size=args.batch_size,
+            use_cudagraph=args.use_cudagraph,
+            use_kvcache=args.use_kvcache,
+            # enable_timing_stats=args.enable_timing_stats,
+            enable_timing_stats=True,
+        )
+    elif args.mode == RunningMode.REGULAR:
+        run_ranking_gr_regular(
+            checkpoint_dir=args.checkpoint_dir,
+            check_auc=not args.disable_auc,
+            disable_contextual_features=args.disable_context,
+            inference_batch_size=args.batch_size,
+            use_cudagraph=args.use_cudagraph,
+            full_mode=args.full_mode,
+            use_kvcache=args.use_kvcache,
+            # enable_timing_stats=args.enable_timing_stats,
+            enable_timing_stats=False,
         )
