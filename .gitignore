@@ -31,3 +31,7 @@ embedding_checkpoint/
 *.pickle
 *.xlsx
 pcie_lookup_poc/*
+dist/
+scripts/
+tensorrt-llm-kvcache
+*log*/

@@ -12,6 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import sys
+import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 import argparse
 import enum
 import math
@@ -265,6 +270,7 @@ def run_ranking_gr_simulate(
         while True:
             try:
                 uids, dates, seq_endptrs = next(dataloader_iter)
+                print(uids, dates, seq_endptrs)
                 if dates[0] != cur_date:
                     # if cur_date is not None:
                         # eval_metric_dict = eval_module.compute()
