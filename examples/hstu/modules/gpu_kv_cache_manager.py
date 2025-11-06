@@ -28,8 +28,10 @@ DataType = tensorrt_llm.bindings.DataType
 
 class HSTUGpuKVCacheManager:
     def __init__(
-        self, hstu_config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig
+        self, hstu_config: InferenceHSTUConfig, kv_cache_config: KVCacheConfig, logger
     ) -> None:
+        self.logger = logger
+        
         self.num_layers = hstu_config.num_layers
         self.head_dim = hstu_config.head_dim
         self.page_size = kv_cache_config.page_size
@@ -302,6 +304,21 @@ class HSTUGpuKVCacheManager:
         onload_num_pages = onload_length // self.page_size
         with torch.cuda.stream(self._onload_stream):
             for layer_idx in range(self.num_layers):
+                
+                # data_size = (
+                #     onload_num_pages
+                #     * 2
+                #     * self.page_size
+                #     * self.num_heads_per_layer[layer_idx]
+                #     * self.head_dim
+                # )
+                # data_size_mb = data_size * 2 / (1024 * 1024)
+                # # print(f"Layer {layer_idx} data size: {data_size_mb:.2f} MB")
+                # self.logger.info(f"Layer {layer_idx} data size: {data_size_mb:.2f} MB") 
+                # start_time = torch.cuda.Event(enable_timing=True)
+                # end_time = torch.cuda.Event(enable_timing=True)
+                # start_time.record()
+                
                 kv_cache_metadata.onload_history_kv_buffer[layer_idx][
                     :onload_num_pages, ...
                 ].copy_(
@@ -310,6 +327,22 @@ class HSTUGpuKVCacheManager:
                 kv_cache_metadata.onload_history_kv_events[layer_idx].record(
                     self._onload_stream
                 )
+                
+                # end_time.record()
+                # torch.cuda.synchronize()  # 确保事件完成
+                # elapsed_time_ms = start_time.elapsed_time(end_time)
+                # # print(f"Layer {layer_idx} copy time: {elapsed_time_ms:.2f} ms")
+                # self.logger.info(f"Layer {layer_idx} copy time: {elapsed_time_ms:.2f} ms")
+
+                # # 计算带宽
+                # if elapsed_time_ms > 0:
+                #     bandwidth_mb_s = data_size_mb / (elapsed_time_ms / 1000)
+                #     bandwidth_gb_s = bandwidth_mb_s / 1024
+                #     print(f"Layer {layer_idx} bandwidth: {bandwidth_gb_s:.2f} GB/s")
+                #     self.logger.info(f"Layer {layer_idx} bandwidth: {bandwidth_gb_s:.2f} GB/s")
+                # else:
+                #     print(f"Layer {layer_idx} bandwidth: N/A (elapsed time is 0)")
+                #     self.logger.info(f"Layer {layer_idx} bandwidth: N/A (elapsed time is 0)")
 
     def get_cache_metadata(self, user_ids: torch.Tensor) -> "KVCacheMetadata":
         batch_size = len(user_ids)

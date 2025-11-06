@@ -16,7 +16,7 @@ import sys
 import os
 os.environ['NUMEXPR_MAX_THREADS'] = '256'
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-os.environ['PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT'] = '3'
+os.environ['PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT'] = '4'
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchmetrics.utilities.prints")
@@ -52,6 +52,7 @@ from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 import numpy as np
+import torch.cuda.nvtx as nvtx
 
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
@@ -59,7 +60,7 @@ from inference_ranking_gr import InferenceRankingGR
 sys.path.append("./training/")
 from gin_config_args import DatasetArgs, NetworkArgs
 
-log_dir = "newlogs/logs_10_28"
+log_dir = "newlogs/logs_11_5"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -81,6 +82,11 @@ class RunningMode(enum.Enum):
     def __str__(self):
         return self.value
 
+
+def trace_handler(p):
+    p.export_chrome_trace("./trace_log/trace_" + str(p.step_num) + ".json")
+    # output = p.key_averages().table(sort_by="self_cuda_time_total", row_limit=6)
+    # print(output)
 
 # duplicate
 @gin.configurable
@@ -327,136 +333,155 @@ def run_ranking_gr_simulate(
         cur_date = None
         model.clear_kv_cache()
         # time_change = 0
-        while True:
-            try:
-                uids, dates, seq_endptrs = next(dataloader_iter)
-                # count += 1
-                num_batches_ctr += 1
-                print(f'{num_batches_ctr}: {uids}')
-                # logger.info(f'{count}: {uids}')
-                
-                # 同batch内用户合并
-                uids_np = uids.cpu().numpy()
-                unique_uids_np, first_occurrence_indices_np = np.unique(uids_np, return_index=True)
-                unique_uids = torch.from_numpy(unique_uids_np).to(uids.device)
-                first_occurrence_indices = torch.from_numpy(first_occurrence_indices_np).to(uids.device)
-                merged_seq_endptrs = torch.zeros_like(unique_uids, dtype=seq_endptrs.dtype)
-                merged_seq_endptrs = merged_seq_endptrs.scatter_reduce(
-                    0, torch.unique(uids, return_inverse=True)[1], seq_endptrs, reduce="amax", include_self=False
-                )
-                merged_dates = dates[first_occurrence_indices]
-                uids = unique_uids
-                dates = merged_dates
-                seq_endptrs = merged_seq_endptrs
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule = torch.profiler.schedule(
+                skip_first=2000,
+                wait=97,
+                warmup=1,
+                active=2,
+                repeat=10
+            ), 
+            with_stack=True,
+            record_shapes=True,
+            on_trace_ready=trace_handler,
+            ) as prof:
+                while True:
+                    try:
+                        uids, dates, seq_endptrs = next(dataloader_iter)
+                        # count += 1
+                        num_batches_ctr += 1
+                        prof.step()
+                        print(f'{num_batches_ctr}: {uids}')
+                        if num_batches_ctr == 3000:
+                            # logger.info(f'{num_batches_ctr}: break')
+                            break
+                        # logger.info(f'{count}: {uids}')
+                        
+                        # 同batch内用户合并
+                        uids_np = uids.cpu().numpy()
+                        unique_uids_np, first_occurrence_indices_np = np.unique(uids_np, return_index=True)
+                        unique_uids = torch.from_numpy(unique_uids_np).to(uids.device)
+                        first_occurrence_indices = torch.from_numpy(first_occurrence_indices_np).to(uids.device)
+                        merged_seq_endptrs = torch.zeros_like(unique_uids, dtype=seq_endptrs.dtype)
+                        merged_seq_endptrs = merged_seq_endptrs.scatter_reduce(
+                            0, torch.unique(uids, return_inverse=True)[1], seq_endptrs, reduce="amax", include_self=False
+                        )
+                        merged_dates = dates[first_occurrence_indices]
+                        uids = unique_uids
+                        dates = merged_dates
+                        seq_endptrs = merged_seq_endptrs
 
-                logger.info(f'{num_batches_ctr}: {uids}, {seq_endptrs}')
-                
-                if dates[0] != cur_date:
-                    if cur_date is not None:
-                        eval_metric_dict = eval_module.compute()
-                        print(
-                            f"[eval]:\n    "
-                            + stringify_dict(
-                                eval_metric_dict, prefix="Metrics", sep="\n    "
+                        logger.info(f'{num_batches_ctr}: {uids}, {seq_endptrs}')
+                        
+                        if dates[0] != cur_date:
+                            if cur_date is not None:
+                                eval_metric_dict = eval_module.compute()
+                                print(
+                                    f"[eval]:\n    "
+                                    + stringify_dict(
+                                        eval_metric_dict, prefix="Metrics", sep="\n    "
+                                    )
+                                )
+                            # model.clear_kv_cache()
+                            # cur_date = dates[0]
+                            if num_batches_ctr == 20220410:
+                                break
+                        if use_kvcache:
+                            cached_start_pos, cached_len = model.get_user_kvdata_info(
+                                uids, dbg_print=True
                             )
+                            logger.info(f'{num_batches_ctr}: cached_start_pos={cached_start_pos.detach().cpu().numpy()}, cached_len={cached_len.detach().cpu().numpy()}')
+                            new_cache_start_pos = cached_start_pos + cached_len
+                            non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                            contextual_mask = torch.logical_not(non_contextual_mask)
+                            seq_startptrs = (
+                                torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                            ).int()
+                        else:
+                            new_cache_start_pos = torch.zeros_like(uids)
+                            logger.info(f'{num_batches_ctr}: {new_cache_start_pos}')
+                            non_contextual_mask = new_cache_start_pos >= num_contextual_features
+                            contextual_mask = torch.logical_not(non_contextual_mask)
+                            seq_startptrs = (
+                                torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
+                            ).int()
+
+                        # batch_0 = dataset.get_input_batch(
+                        #     uids[non_contextual_mask],
+                        #     dates[non_contextual_mask],
+                        #     seq_endptrs[non_contextual_mask],
+                        #     seq_startptrs[non_contextual_mask],
+                        #     with_contextual_features=False,
+                        #     with_ranking_labels=True,
+                        # )
+                        # if batch_0 is not None:
+                        #     if use_kvcache:
+                        #         logits = model.forward(
+                        #             batch_0,
+                        #             uids[non_contextual_mask].int(),
+                        #             new_cache_start_pos[non_contextual_mask],
+                        #         )
+                        #     else:
+                        #         logits = model.forward_no_cache(
+                        #             batch_0,
+                        #             uids[non_contextual_mask].int(),
+                        #             new_cache_start_pos[non_contextual_mask],
+                        #         )
+                        #     eval_module(logits, batch_0.labels)
+
+                        # batch_1 = dataset.get_input_batch(
+                        #     uids[contextual_mask],
+                        #     dates[contextual_mask],
+                        #     seq_endptrs[contextual_mask],
+                        #     seq_startptrs[contextual_mask],
+                        #     with_contextual_features=True,
+                        #     with_ranking_labels=True,
+                        # )
+                        # if batch_1 is not None:
+                        #     if use_kvcache:
+                        #         logits = model.forward(
+                        #             batch_1,
+                        #             uids[contextual_mask].int(),
+                        #             new_cache_start_pos[contextual_mask],
+                        #         )
+                        #     else:
+                        #         logits = model.forward_no_cache(
+                        #             batch_1,
+                        #             uids[contextual_mask].int(),
+                        #             new_cache_start_pos[contextual_mask],
+                        #         )
+                        #     eval_module(logits, batch_1.labels)
+                        batch = dataset.get_input_batch(
+                            uids,
+                            dates,
+                            seq_endptrs,
+                            seq_startptrs,
+                            with_contextual_features=contextual_mask.tolist(),  # 传入bool列表
+                            with_ranking_labels=True,
                         )
-                    # model.clear_kv_cache()
-                    # cur_date = dates[0]
-                    if num_batches_ctr == 20220410:
+
+                        if batch is not None:
+                            if use_kvcache:
+                                with nvtx.range(f"forward_batch_{num_batches_ctr}"): 
+                                    logits = model.forward(
+                                        batch,
+                                        uids.int(),
+                                        new_cache_start_pos,
+                                    )
+                            else:
+                                logits = model.forward_no_cache(
+                                    batch,
+                                    uids.int(),
+                                    new_cache_start_pos,
+                                )
+                            eval_module(logits, batch.labels)
+                        if num_batches_ctr * max_batch_size >= 140000:
+                            break
+                        
+
+                    except StopIteration:
                         break
-                if use_kvcache:
-                    cached_start_pos, cached_len = model.get_user_kvdata_info(
-                        uids, dbg_print=True
-                    )
-                    logger.info(f'{num_batches_ctr}: cached_start_pos={cached_start_pos.detach().cpu().numpy()}, cached_len={cached_len.detach().cpu().numpy()}')
-                    new_cache_start_pos = cached_start_pos + cached_len
-                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
-                    contextual_mask = torch.logical_not(non_contextual_mask)
-                    seq_startptrs = (
-                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
-                    ).int()
-                else:
-                    new_cache_start_pos = torch.zeros_like(uids)
-                    logger.info(f'{num_batches_ctr}: {new_cache_start_pos}')
-                    non_contextual_mask = new_cache_start_pos >= num_contextual_features
-                    contextual_mask = torch.logical_not(non_contextual_mask)
-                    seq_startptrs = (
-                        torch.clip(new_cache_start_pos - num_contextual_features, 0) / 2
-                    ).int()
-
-                # batch_0 = dataset.get_input_batch(
-                #     uids[non_contextual_mask],
-                #     dates[non_contextual_mask],
-                #     seq_endptrs[non_contextual_mask],
-                #     seq_startptrs[non_contextual_mask],
-                #     with_contextual_features=False,
-                #     with_ranking_labels=True,
-                # )
-                # if batch_0 is not None:
-                #     if use_kvcache:
-                #         logits = model.forward(
-                #             batch_0,
-                #             uids[non_contextual_mask].int(),
-                #             new_cache_start_pos[non_contextual_mask],
-                #         )
-                #     else:
-                #         logits = model.forward_no_cache(
-                #             batch_0,
-                #             uids[non_contextual_mask].int(),
-                #             new_cache_start_pos[non_contextual_mask],
-                #         )
-                #     eval_module(logits, batch_0.labels)
-
-                # batch_1 = dataset.get_input_batch(
-                #     uids[contextual_mask],
-                #     dates[contextual_mask],
-                #     seq_endptrs[contextual_mask],
-                #     seq_startptrs[contextual_mask],
-                #     with_contextual_features=True,
-                #     with_ranking_labels=True,
-                # )
-                # if batch_1 is not None:
-                #     if use_kvcache:
-                #         logits = model.forward(
-                #             batch_1,
-                #             uids[contextual_mask].int(),
-                #             new_cache_start_pos[contextual_mask],
-                #         )
-                #     else:
-                #         logits = model.forward_no_cache(
-                #             batch_1,
-                #             uids[contextual_mask].int(),
-                #             new_cache_start_pos[contextual_mask],
-                #         )
-                #     eval_module(logits, batch_1.labels)
-                batch = dataset.get_input_batch(
-                    uids,
-                    dates,
-                    seq_endptrs,
-                    seq_startptrs,
-                    with_contextual_features=contextual_mask.tolist(),  # 传入bool列表
-                    with_ranking_labels=True,
-                )
-
-                if batch is not None:
-                    if use_kvcache:
-                        logits = model.forward(
-                            batch,
-                            uids.int(),
-                            new_cache_start_pos,
-                        )
-                    else:
-                        logits = model.forward_no_cache(
-                            batch,
-                            uids.int(),
-                            new_cache_start_pos,
-                        )
-                    eval_module(logits, batch.labels)
-                if num_batches_ctr * max_batch_size >= 140000:
-                    break
-
-            except StopIteration:
-                break
         end_time = time.time()
         print("Total #batch:", num_batches_ctr)
         print("Total time(s):", end_time - start_time)
@@ -750,7 +775,7 @@ if __name__ == "__main__":
             use_cudagraph=args.use_cudagraph,
             use_kvcache=args.use_kvcache,
             # enable_timing_stats=args.enable_timing_stats,
-            enable_timing_stats=True,
+            enable_timing_stats=False,
         )
     elif args.mode == RunningMode.REGULAR:
         run_ranking_gr_regular(

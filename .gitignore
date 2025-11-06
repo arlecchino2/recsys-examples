@@ -3,6 +3,7 @@ __pycache__
 build
 .coverage_*
 *.egg-info
+*.egg
 *~
 slurm*
 logs
@@ -32,3 +33,9 @@ embedding_checkpoint/
 *.xlsx
 pcie_lookup_poc/*
 tensorrt-llm-kvcache/
+gpu_monitor_logs/
+monitor_gpu.sh
+monitor_gpu_witout_kv.sh
+newlogs/
+*.json
+trace_log
