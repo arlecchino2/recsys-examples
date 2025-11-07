@@ -61,7 +61,7 @@ class AsyncHSTUKVCacheManager:
         self.static_offload_page_ids_gpu_buffer = torch.empty([self.max_batch_size * self.max_num_pages_per_seq,], dtype=torch.int32).cuda()
         self.static_pinned_kv_buffer = torch.empty(
             [self.num_layers, self.max_batch_size * self.max_num_pages_per_seq, 2, self.page_size, self.num_heads, self.head_dim],
-            dtype=torch.bfloat16, pin_memory=False
+            dtype=torch.bfloat16, pin_memory=True
         )
         self.static_onload_handle = paged_kvcache_ops.KVOnloadHandle(self.num_layers)
 

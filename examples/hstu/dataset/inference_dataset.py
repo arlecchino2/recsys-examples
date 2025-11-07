@@ -112,8 +112,16 @@ class InferenceDataset(IterableDataset[Batch]):
                 batch_logs_file, delimiter=",", nrows=batch_nrows
             )
 
+        # date 20220425 对应的时间戳: 1650844800000
+        # 筛选条件：interval_end_ts > 1650844800000 且 interval_indptr > 1000
+        self._batch_logs_frame = self._batch_logs_frame[
+            (self._batch_logs_frame["interval_end_ts"] > 1650844800000) &
+            (self._batch_logs_frame["interval_indptr"] >= 6000) &
+            (self._batch_logs_frame["interval_indptr"] <= 10000)
+        ]
+    
         self._batch_logs_frame.sort_values(by=timestamp_names, inplace=True)
-        len(self._batch_logs_frame)
+        print(f'len of self._batch_logs_frame, {len(self._batch_logs_frame)}')
 
         self._num_samples = len(self._batch_logs_frame)
         self._max_seqlen = max_seqlen

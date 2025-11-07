@@ -14,9 +14,14 @@
 # limitations under the License.
 import sys
 import os
-
+os.environ['NUMEXPR_MAX_THREADS'] = '256'
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+os.environ['PYDEVD_WARN_SLOW_RESOLVE_TIMEOUT'] = '4'
+
+from datetime import datetime
+import logging
+
 import argparse
 import enum
 import math
@@ -42,9 +47,24 @@ from preprocessor import get_common_preprocessors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from utils import DatasetArgs, NetworkArgs, RankingArgs
 
+import torch.cuda.nvtx as nvtx
+
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
+log_dir = "./logs/logs_11_07"
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = False
+file_handler = logging.FileHandler(log_file, mode='a', encoding=None, delay=False)
+file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(message)s')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
@@ -53,6 +73,8 @@ class RunningMode(enum.Enum):
     def __str__(self):
         return self.value
 
+def trace_handler(p):
+    p.export_chrome_trace("./logs/trace_log/trace_" + str(p.step_num) + ".json")
 
 def get_inference_dataset_and_embedding_configs(
     disable_contextual_features: bool = False,
@@ -135,6 +157,7 @@ def get_inference_hstu_model(
     num_contextual_features,
     total_max_seqlen,
     checkpoint_dir,
+    enable_timing_stats,
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -165,9 +188,9 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        "blocks_in_primary_pool": 40960,
+        "blocks_in_primary_pool": 10240,
         "page_size": 32,
-        "offload_chunksize": 10240,
+        "offload_chunksize": 1024,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -192,8 +215,10 @@ def get_inference_hstu_model(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config,
         task_config=task_config,
+        logger=logger,
         use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
+        enable_timing_stats=enable_timing_stats,
     )
     if hstu_config.bf16:
         model.bfloat16()
@@ -211,6 +236,7 @@ def run_ranking_gr_simulate(
     disable_contextual_features: bool = False,
     disable_kvcache: bool = False,
     max_bs: int = 1,
+    enable_timing_stats: bool = False
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -234,6 +260,7 @@ def run_ranking_gr_simulate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            enable_timing_stats,
         )
 
         if check_auc:
@@ -267,53 +294,76 @@ def run_ranking_gr_simulate(
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
-        while True:
-            try:
-                uids, dates, seq_endptrs = next(dataloader_iter)
-                print(uids, dates, seq_endptrs)
-                if dates[0] != cur_date:
-                    # if cur_date is not None:
-                        # eval_metric_dict = eval_module.compute()
-                        # print(
-                        #     f"[eval]:\n    "
-                        #     + stringify_dict(
-                        #         eval_metric_dict, prefix="Metrics", sep="\n    "
-                        #     )
-                        # )
-                    # model.clear_kv_cache()
-                    if cur_date is not None:
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule = torch.profiler.schedule(
+                skip_first=1000,
+                wait=997,
+                warmup=2,
+                active=1,
+                repeat=10
+            ), 
+            with_stack=True,
+            record_shapes=True,
+            on_trace_ready=trace_handler,
+        ) as prof:
+            while True:
+                try:
+                    uids, dates, seq_endptrs = next(dataloader_iter)
+                    # print(uids, dates, seq_endptrs)
+                    if dates[0] != cur_date:
+                        # if cur_date is not None:
+                            # eval_metric_dict = eval_module.compute()
+                            # print(
+                            #     f"[eval]:\n    "
+                            #     + stringify_dict(
+                            #         eval_metric_dict, prefix="Metrics", sep="\n    "
+                            #     )
+                            # )
+                        # model.clear_kv_cache()
+                        if cur_date is not None:
+                            break
+                        cur_date = dates[0]
+
+                    batch = dataset.get_input_batch(
+                        uids,
+                        dates,
+                        seq_endptrs,
+                        torch.zeros_like(seq_endptrs),
+                        with_contextual_features=True,
+                        with_ranking_labels=False,
+                    )
+                    total_history_lengths = seq_endptrs * 2 + num_contextual_features
+                    
+                    if batch is not None:
+                        if not disable_kvcache:
+                            with nvtx.range(f"forward_batch_{num_batches_ctr}"): 
+                                logits = model.forward(
+                                    batch,
+                                    uids,
+                                    total_history_lengths,
+                                )
+                        else:
+                            with nvtx.range(f"forward_nokvcache_{num_batches_ctr}"):
+                                logits = model.forward_nokvcache(batch)
+                        # eval_module(logits, batch.labels)
+
+                    num_batches_ctr += 1
+                    prof.step()
+                    logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
+                    print(f"{num_batches_ctr}, uids: {uids.tolist()}")
+                    # if num_batches_ctr == 1000:
+                    if num_batches_ctr * max_batch_size >= 140000:
                         break
-                    cur_date = dates[0]
-
-                batch = dataset.get_input_batch(
-                    uids,
-                    dates,
-                    seq_endptrs,
-                    torch.zeros_like(seq_endptrs),
-                    with_contextual_features=True,
-                    with_ranking_labels=False,
-                )
-                total_history_lengths = seq_endptrs * 2 + num_contextual_features
-                
-                if batch is not None:
-                    if not disable_kvcache:
-                        logits = model.forward(
-                            batch,
-                            uids,
-                            total_history_lengths,
-                        )
-                    else:
-                        logits = model.forward_nokvcache(batch)
-                    # eval_module(logits, batch.labels)
-
-                num_batches_ctr += 1
-                # if num_batches_ctr == 1000:
-                #     break
-            except StopIteration:
-                break
+                except StopIteration:
+                    break
         end_time = time.time()
         print("Total #batch:", num_batches_ctr)
         print("Total time(s):", end_time - start_time)
+        logger.info(f"Total #batch: {num_batches_ctr}")
+        logger.info(f"Total time(s): {end_time - start_time}")
+        if enable_timing_stats:
+            model._print_timing_summary()
 
 
 def run_ranking_gr_evaluate(
@@ -438,11 +488,12 @@ if __name__ == "__main__":
     parser.add_argument("--disable_context", action="store_true")
     parser.add_argument("--disable_kvcache", action="store_true")
     parser.add_argument("--max_bs", type=int, required=True)
-
+    parser.add_argument('--gpu', type=int, default=1, help='GPU id for inference')
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
 
+    torch.cuda.set_device(args.gpu)
     if args.mode == RunningMode.EVAL:
         if args.disable_auc:
             print("disable_auc is ignored in Eval mode.")
@@ -459,5 +510,6 @@ if __name__ == "__main__":
             disable_contextual_features=args.disable_context,
             disable_kvcache=args.disable_kvcache,
             max_bs=args.max_bs,
+            enable_timing_stats=False,
         )
     print("Finished.")
