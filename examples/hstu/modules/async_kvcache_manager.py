@@ -5,6 +5,7 @@ import math
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from configs import KVCacheMetadata
 import os
+import time
 
 # def offload_callback(fut):
 #     torch.cuda.empty_cache()
@@ -50,7 +51,7 @@ class AsyncHSTUKVCacheManager:
             self.num_layers, self.num_heads, self.head_dim, self.page_size,
             self.num_primary_cache_pages, self.num_onload_buffer_pages,
             self.num_reserved_buffer_pages, self.chunk_size,
-            self.max_num_sequences, self.max_num_sequences, 
+            self.max_num_sequences, self.max_num_sequences,
             self.cache_table
         )
         self.host_kv_mgr = paged_kvcache_ops.HostKVStorageImpl(
@@ -66,6 +67,11 @@ class AsyncHSTUKVCacheManager:
         self.static_onload_handle = paged_kvcache_ops.KVOnloadHandle(self.num_layers)
 
         self.cache_table_list = [ self.cache_table[idx] for idx in range(self.num_layers) ]
+        self.prepare_time = 0
+        self.onload_time = 0
+        self.total_prepare_time = 0
+        self.total_onload_time = 0
+
 
     def prepare_kvcache_async(self, 
         batch_size, 
@@ -111,9 +117,13 @@ class AsyncHSTUKVCacheManager:
         metadata_host_buffer, 
         metadata_gpu_buffer,
         static_onload_handle):
-
+        # prep_start = time.time()
         onload_fut.result()
+        # self.onload_time += (time.time() - prep_start)
         kvcache_metadata_fut.result()
+        # self.prepare_time += (time.time() - prep_start)
+        # print("onload time: ", self.onload_time)
+        # print("prepare time: ", self.prepare_time)
         return self.get_kvcache_metadata_from_buffer(
             batch_size,
             new_tokens,

@@ -26,8 +26,6 @@ from configs import (
     get_kvcache_metadata_buffer,
 )
 from dataset.utils import Batch
-from modules.gpu_kv_cache_manager import HSTUGpuKVCacheManager
-from modules.host_kv_storage_manager import HSTUHostKVStorageManager
 from modules.hstu_block_inference import HSTUBlockInference
 from modules.inference_embedding import InferenceEmbedding
 from modules.jagged_data import JaggedData
@@ -210,6 +208,15 @@ class InferenceRankingGR(torch.nn.Module):
         #     dense=self._position_embeddings_weight,
         #     scale=alpha,
         #     ind_offsets=ind_offsets)
+        self.count = 0
+
+        self.cache_stats = {
+            'total_gpu_length': 0,
+            'total_host_load_length': 0,
+            'total_new_tokens': 0,
+            'total_sequence_length': 0,
+            'batch_count': 0
+        }
     
     def _update_timing_stats(self, method_name, timing_info):
         if not self.enable_timing_stats:
@@ -245,6 +252,87 @@ class InferenceRankingGR(torch.nn.Module):
                     percentage = (avg_step / avg_total) * 100
                     self.logger.info(f"    {step}: {avg_step:.6f}s ({percentage:.1f}%)")
 
+    
+    def analyze_cache_distribution(
+        self,
+        user_ids: torch.Tensor,
+        total_history_lengths: torch.Tensor,
+    ):
+        with torch.inference_mode():
+            # 获取GPU缓存信息
+            gpu_cache_info = self.async_kvcache.gpu_kvcache_mgr.get_cache_startpos_and_length(user_ids.tolist())
+            # 获取Host缓存信息  
+            host_cache_info = self.async_kvcache.host_kv_mgr.get_cache_startpos_and_length(user_ids.tolist())
+            
+            batch_size = len(user_ids)
+            cache_distribution = {
+                'user_ids': user_ids.tolist(),
+                'total_lengths': total_history_lengths.tolist(),
+                'gpu_cache': [],
+                'host_cache': [],
+                'new_tokens': []
+            }
+            
+            for i in range(batch_size):
+                uid = user_ids[i].item()
+                total_length = total_history_lengths[i].item()
+                gpu_start, gpu_length = gpu_cache_info[i]
+                host_start, host_length = host_cache_info[i]
+                host_load_length = gpu_start
+                gpu_cache_length = gpu_length
+                new_tokens = total_length - (gpu_start + gpu_length)
+                cache_distribution['gpu_cache'].append({
+                    'start': gpu_start,
+                    'length': gpu_cache_length
+                })
+                cache_distribution['host_cache'].append({
+                    'start': host_start,
+                    'length': host_length,
+                    'load_length': host_load_length
+                })
+                cache_distribution['new_tokens'].append(new_tokens)
+            return cache_distribution
+
+    def update_cache_stats(self, cache_distribution):
+        batch_gpu_length = sum(gpu['length'] for gpu in cache_distribution['gpu_cache'])
+        batch_host_load_length = sum(host['load_length'] for host in cache_distribution['host_cache'])
+        batch_new_tokens = sum(cache_distribution['new_tokens'])
+        batch_total_length = sum(cache_distribution['total_lengths'])
+        
+        if self.count > 999:
+            self.cache_stats['total_gpu_length'] += batch_gpu_length
+            self.cache_stats['total_host_load_length'] += batch_host_load_length
+            self.cache_stats['total_new_tokens'] += batch_new_tokens
+            self.cache_stats['total_sequence_length'] += batch_total_length
+            self.cache_stats['batch_count'] += 1
+        
+        # 记录每个batch的缓存分布
+        self.logger.info(f"Host Load: {batch_host_load_length}, "
+                        f"GPU Cache: {batch_gpu_length}, "
+                        f"New Tokens: {batch_new_tokens}")
+
+    def print_cache_summary(self):
+        if self.cache_stats['batch_count'] == 0:
+            return
+            
+        total_cached = self.cache_stats['total_gpu_length'] + self.cache_stats['total_host_load_length']
+        gpu_hit_rate = self.cache_stats['total_gpu_length'] / self.cache_stats['total_sequence_length'] * 100
+        host_hit_rate = self.cache_stats['total_host_load_length'] / self.cache_stats['total_sequence_length'] * 100
+        new_token_rate = self.cache_stats['total_new_tokens'] / self.cache_stats['total_sequence_length'] * 100
+        
+        self.logger.info("=" * 60)
+        self.logger.info("CACHE HIT RATE SUMMARY")
+        self.logger.info("=" * 60)
+        self.logger.info(f"Total Batches: {self.cache_stats['batch_count']}")
+        self.logger.info(f"Total Sequence Length: {self.cache_stats['total_sequence_length']}")
+        self.logger.info(f"Total Host Load Length: {self.cache_stats['total_host_load_length']} ({host_hit_rate:.2f}%)")
+        self.logger.info(f"Total GPU Cache Length: {self.cache_stats['total_gpu_length']} ({gpu_hit_rate:.2f}%)")
+        self.logger.info(f"Total New Tokens: {self.cache_stats['total_new_tokens']} ({new_token_rate:.2f}%)")
+        self.logger.info(f"Total Cached: {total_cached} ({(total_cached / self.cache_stats['total_sequence_length'] * 100):.2f}%)")
+        self.logger.info(f"GPU Cache Hit Rate: {gpu_hit_rate:.2f}%")
+        self.logger.info("=" * 60)
+    
+    
     def bfloat16(self):
         """
         Convert the model to use bfloat16 precision. Only affects the dense module.
@@ -589,6 +677,8 @@ class InferenceRankingGR(torch.nn.Module):
         total_history_lengths: torch.Tensor,
     ):
         with torch.inference_mode():
+            cache_distribution = self.analyze_cache_distribution(user_ids, total_history_lengths)
+            self.update_cache_stats(cache_distribution)
             if self.enable_timing_stats:
                 start_time = time.time()
                 timing_info = {}
@@ -672,6 +762,32 @@ class InferenceRankingGR(torch.nn.Module):
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
                 timing_info['prepare_kvcache_wait'] = time.time() - prepare_kvcache_wait_start
+            # print("[DEBUG] kv_indices", kvcache_metadata.kv_indices)
+            # print("[DEBUG] kv_indptr", kvcache_metadata.kv_indptr)
+            # print("[DEBUG] kv_last_page_len", kvcache_metadata.kv_last_page_len)
+            # print("[DEBUG] total_history_lengths", kvcache_metadata.total_history_lengths)
+            # print("[DEBUG] total_history_offsets", kvcache_metadata.total_history_offsets)
+            # print("[DEBUG] seqlen", jagged_data.seqlen)
+            # print("[DEBUG] seqlen_offsets", jagged_data.seqlen_offsets)
+            # print("[DEBUG] num_candidates_offsets", jagged_data.num_candidates_offsets)
+            # print("[DEBUG] >>> ", kvcache_metadata.batch_indices.shape)
+
+            # print("[DEBUG] batch_indices", kvcache_metadata.batch_indices)
+            # print("[DEBUG] position", kvcache_metadata.position)
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[:154])
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[154:154*2])
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*2:154*3])
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*3:154*4])
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*4:154*5])
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*5:154*6])
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*6:154*7])
+            # print("[DEBUG] batch_indices", kvcache_metadata.position[154*7:154*8])
+            # print("[DEBUG] >>> ", kvcache_metadata.position.shape)
+            # print("[DEBUG] new_history_nnz", kvcache_metadata.new_history_nnz)
+            # print("[DEBUG] new_history_nnz_cuda", kvcache_metadata.new_history_nnz_cuda)
+
+            # print("kvcache_metadata.offload_user_ids", kvcache_metadata.offload_user_ids)
+            # print("kvcache_metadata.offload_page_ids", kvcache_metadata.offload_page_ids.shape)
 
             # 6. 更新KV Cache元数据
             if self.enable_timing_stats:
@@ -698,7 +814,7 @@ class InferenceRankingGR(torch.nn.Module):
                 )
                 jagged_data.values = hstu_output
             if self.enable_timing_stats:
-                torch.cuda.synchronize()
+                # torch.cuda.synchronize()
                 timing_info['hstu_inference'] = time.time() - hstu_start
 
             # 8. 最终化KV Cache
@@ -722,11 +838,13 @@ class InferenceRankingGR(torch.nn.Module):
                 timing_info['postprocess_and_mlp'] = time.time() - postprocess_start
                 timing_info['total_time'] = time.time() - start_time
 
-                self._update_timing_stats('forward_with_cache', timing_info)
-                
-                self.logger.info(f"====== Forward WITH KV Cache (Call #{self.timing_stats['forward_with_cache']['count']}) ======")
-                for step, duration in timing_info.items():
-                    self.logger.info(f"{step}: {duration:.6f}s")
+                self.count += 1
+                if self.count > 1000:
+                    self._update_timing_stats('forward_with_cache', timing_info)
+                    
+                    # self.logger.info(f"====== Forward WITH KV Cache (Call #{self.timing_stats['forward_with_cache']['count']}) ======")
+                    # for step, duration in timing_info.items():
+                    #     self.logger.info(f"{step}: {duration:.6f}s")
 
         return jagged_item_logit
     
@@ -785,11 +903,13 @@ class InferenceRankingGR(torch.nn.Module):
                 timing_info['postprocess_and_mlp'] = time.time() - postprocess_start
                 timing_info['total_time'] = time.time() - start_time
 
-                self._update_timing_stats('forward_no_cache', timing_info)
-                
-                self.logger.info(f"====== Forward WITHOUT KV Cache (Call #{self.timing_stats['forward_no_cache']['count']}) ======")
-                for step, duration in timing_info.items():
-                    self.logger.info(f"{step}: {duration:.6f}s")
+                self.count += 1
+                if self.count > 1000:
+                    self._update_timing_stats('forward_no_cache', timing_info)
+                    
+                    self.logger.info(f"====== Forward WITHOUT KV Cache (Call #{self.timing_stats['forward_no_cache']['count']}) ======")
+                    for step, duration in timing_info.items():
+                        self.logger.info(f"{step}: {duration:.6f}s")
 
         return jagged_item_logit
 

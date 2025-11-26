@@ -52,7 +52,7 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_11_25"
+log_dir = "./logs_without_kv/logs_11_11"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -74,7 +74,7 @@ class RunningMode(enum.Enum):
         return self.value
 
 def trace_handler(p):
-    p.export_chrome_trace("./logs/trace_log/trace_" + str(p.step_num) + ".json")
+    p.export_chrome_trace("./logs_without_kv/trace_without_kv_log/trace_" + str(p.step_num) + ".json")
 
 def get_inference_dataset_and_embedding_configs(
     disable_contextual_features: bool = False,
@@ -158,7 +158,6 @@ def get_inference_hstu_model(
     total_max_seqlen,
     checkpoint_dir,
     enable_timing_stats,
-    blocks_in_primary_pool,
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -189,8 +188,7 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        # "blocks_in_primary_pool": 10240,
-        "blocks_in_primary_pool": blocks_in_primary_pool,
+        "blocks_in_primary_pool": 10240,
         "page_size": 32,
         "offload_chunksize": 4096,
         "max_batch_size": max_batch_size,
@@ -238,8 +236,7 @@ def run_ranking_gr_simulate(
     disable_contextual_features: bool = False,
     disable_kvcache: bool = False,
     max_bs: int = 1,
-    enable_timing_stats: bool = False,
-    blocks_in_primary_pool: int = 10240,
+    enable_timing_stats: bool = False
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -256,9 +253,6 @@ def run_ranking_gr_simulate(
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
-    # blocks_in_primary_pool_values = list(range(12288, 12299, 2048))
-
-    logger.info(f"blocks_in_primary_pool: {blocks_in_primary_pool}")
     with torch.inference_mode():
         model = get_inference_hstu_model(
             emb_configs,
@@ -267,7 +261,6 @@ def run_ranking_gr_simulate(
             total_max_seqlen,
             checkpoint_dir,
             enable_timing_stats,
-            blocks_in_primary_pool,
         )
 
         if check_auc:
@@ -301,7 +294,6 @@ def run_ranking_gr_simulate(
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
-        # torch.cuda.memory._record_memory_history(max_entries=100000)
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             schedule = torch.profiler.schedule(
@@ -318,10 +310,6 @@ def run_ranking_gr_simulate(
             while True:
                 try:
                     num_batches_ctr += 1
-                    # if num_batches_ctr == 5:
-                    #    torch.cuda.memory._dump_snapshot(f"hstu_model.pickle")
-                    #    torch.cuda.memory._record_memory_history(enabled=None)
-                    #    break
                     if num_batches_ctr == 1000:
                         start_time = time.time()
                     uids, dates, seq_endptrs = next(dataloader_iter)
@@ -340,7 +328,6 @@ def run_ranking_gr_simulate(
                             break
                         cur_date = dates[0]
 
-                    
                     batch = dataset.get_input_batch(
                         uids,
                         dates,
@@ -363,7 +350,6 @@ def run_ranking_gr_simulate(
                             with nvtx.range(f"forward_nokvcache_{num_batches_ctr}"):
                                 logits = model.forward_nokvcache(batch)
                         # eval_module(logits, batch.labels)
-
                     
                     prof.step()
                     logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
@@ -378,7 +364,6 @@ def run_ranking_gr_simulate(
         print("Total time(s):", end_time - start_time)
         logger.info(f"Total #batch: {num_batches_ctr}")
         logger.info(f"Total time(s): {end_time - start_time}")
-        model.print_cache_summary()
         if enable_timing_stats:
             model._print_timing_summary()
 
@@ -506,7 +491,6 @@ if __name__ == "__main__":
     parser.add_argument("--disable_kvcache", action="store_true")
     parser.add_argument("--max_bs", type=int, required=True)
     parser.add_argument('--gpu', type=int, default=1, help='GPU id for inference')
-    parser.add_argument('--blocks_in_primary_pool', type=int, default=10240, help='KV cache blocks in primary pool')
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
@@ -529,6 +513,5 @@ if __name__ == "__main__":
             disable_kvcache=args.disable_kvcache,
             max_bs=args.max_bs,
             enable_timing_stats=True,
-            blocks_in_primary_pool=args.blocks_in_primary_pool,
         )
     print("Finished.")
