@@ -347,6 +347,14 @@ class HSTUBlockPostprocessor(torch.nn.Module):
         if jd.max_num_candidates > 0:
             seqlen_offsets = jd.num_candidates_offsets
             max_seqlen = jd.max_num_candidates
+            print("jd.values.shape:", jd.values.shape)
+            print("jd.max_seqlen:", jd.max_seqlen)
+            print("jd.seqlen_offsets.shape:", jd.seqlen_offsets.shape)
+            print("jd.num_candidates_offsets.shape:", jd.num_candidates_offsets.shape)
+            print("jd.seqlen_offsets:", jd.seqlen_offsets)
+            print("jd.num_candidates_offsets:", jd.num_candidates_offsets)
+            print("offsets_a:", jd.seqlen_offsets - jd.num_candidates_offsets)
+            print("offsets_b:", seqlen_offsets)
             _, sequence_embeddings = triton_split_2D_jagged(
                 jd.values,
                 jd.max_seqlen,

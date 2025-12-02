@@ -36,6 +36,7 @@ import math
 import time
 
 import torch.cuda.nvtx as nvtx
+import paged_kvcache_ops
 
 def get_jagged_metadata_buffer(max_batch_size, max_seq_len, contextual_max_seqlen):
     int_dtype = torch.int32
@@ -814,9 +815,13 @@ class InferenceRankingGR(torch.nn.Module):
                 )
                 jagged_data.values = hstu_output
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['hstu_inference'] = time.time() - hstu_start
 
+            paged_kvcache_ops.sync_onload_buffer_to_cache(
+                self.async_kvcache.gpu_kvcache_mgr, user_ids.tolist()
+            )
+            
             # 8. 最终化KV Cache
             if self.enable_timing_stats:
                 finalize_kvcache_start = time.time()

@@ -52,7 +52,7 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_11_25"
+log_dir = "./logs/logs_12_1"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -325,6 +325,7 @@ def run_ranking_gr_simulate(
                     if num_batches_ctr == 1000:
                         start_time = time.time()
                     uids, dates, seq_endptrs = next(dataloader_iter)
+                    print(f"{num_batches_ctr}, uids: {uids.tolist()}")
                     # print(uids, dates, seq_endptrs)
                     if dates[0] != cur_date:
                         # if cur_date is not None:
@@ -367,7 +368,7 @@ def run_ranking_gr_simulate(
                     
                     prof.step()
                     logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
-                    print(f"{num_batches_ctr}, uids: {uids.tolist()}")
+                    
                     # if num_batches_ctr == 1000:
                     if num_batches_ctr * max_batch_size >= 140000:
                         break
