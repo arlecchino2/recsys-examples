@@ -52,7 +52,7 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_12_1"
+log_dir = "./logs/logs_12_3"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):

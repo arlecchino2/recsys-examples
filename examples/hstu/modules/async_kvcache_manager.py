@@ -237,3 +237,7 @@ class AsyncHSTUKVCacheManager:
 
         torch.cuda.nvtx.range_pop()
         return batch
+    
+    def sync_onload_buffer_to_cache(self, user_ids):
+        user_id_list = user_ids.tolist()
+        paged_kvcache_ops.sync_onload_buffer_to_cache(self.gpu_kvcache_mgr, user_id_list)
