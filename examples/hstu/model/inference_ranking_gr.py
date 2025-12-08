@@ -139,11 +139,6 @@ class InferenceRankingGR(torch.nn.Module):
 
         self._embedding_collection = InferenceEmbedding(task_config.embedding_configs)
 
-        # self._gpu_kv_cache_manager = HSTUGpuKVCacheManager(hstu_config, kvcache_config)
-        # self._host_kv_storage_manager = HSTUHostKVStorageManager(
-        #     hstu_config, kvcache_config
-        # )
-
         self._hstu_block = HSTUBlockInference(hstu_config, kvcache_config)
         self._mlp = MLP(
             self._embedding_dim,
@@ -686,10 +681,12 @@ class InferenceRankingGR(torch.nn.Module):
             # 1. 准备KV Cache
             if self.enable_timing_stats:
                 prepare_kvcache_start = time.time()
-            with nvtx.range("prepare_kvcache_async"):
+            with nvtx.range("prepare_kvcache_async"):            
+                user_ids_list = user_ids.tolist()
+
                 prepare_kvcache_result = self.async_kvcache.prepare_kvcache_async(
                     batch.batch_size,
-                    user_ids.tolist(),
+                    user_ids_list,
                     total_history_lengths.tolist(),
                     self.async_kvcache.static_page_ids_gpu_buffer,
                     self.async_kvcache.static_offload_page_ids_gpu_buffer,
@@ -762,6 +759,7 @@ class InferenceRankingGR(torch.nn.Module):
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
                 timing_info['prepare_kvcache_wait'] = time.time() - prepare_kvcache_wait_start
+
             # print("[DEBUG] kv_indices", kvcache_metadata.kv_indices)
             # print("[DEBUG] kv_indptr", kvcache_metadata.kv_indptr)
             # print("[DEBUG] kv_last_page_len", kvcache_metadata.kv_last_page_len)
@@ -819,13 +817,14 @@ class InferenceRankingGR(torch.nn.Module):
             
             # 8. 最终化KV Cache
             if self.enable_timing_stats:
-                finalize_kvcache_start = time.time()
-            with nvtx.range("finalize_kvcache"):
-                kvcache_metadata.kv_offload_handle.record_ready()
-                fut = self.async_kvcache.finalize_kvcache(kvcache_metadata)
+                offload_kvcache_start = time.time()
+            with nvtx.range("offload_kvcache"):
+                self.async_kvcache.offload_kvcache(kvcache_metadata)
+                # kvcache_metadata.kv_offload_handle.record_ready()
+                # fut = self.async_kvcache.finalize_kvcache(kvcache_metadata)
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
-                timing_info['finalize_kvcache'] = time.time() - finalize_kvcache_start
+                timing_info['offload_kvcache'] = time.time() - offload_kvcache_start
 
             # 9. 后处理和MLP
             if self.enable_timing_stats:

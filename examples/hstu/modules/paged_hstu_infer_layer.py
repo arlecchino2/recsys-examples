@@ -298,7 +298,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 0,  # NHD layout
             )
 
-            kv_cache_metadata.kv_onload_handle.wait(self.layer_idx)
+            kv_cache_metadata.kv_onload_handle.wait_host(self.layer_idx)
             jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
                 query,
                 key,
