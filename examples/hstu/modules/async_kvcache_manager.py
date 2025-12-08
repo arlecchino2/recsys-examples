@@ -179,7 +179,7 @@ class AsyncHSTUKVCacheManager:
             kv_onload_handle = static_onload_handle,
             kv_offload_handle = paged_kvcache_ops.KVOffloadHandle(),
             offload_user_ids = offload_uids_buffer[: metadata_host_buffer[batch_size * 7 + 6]],
-            offload_page_ids = static_offload_page_ids_gpu_buffer[: int(metadata_host_buffer[batch_size * 7 + 5])],
+            offload_page_ids = static_offload_page_ids_gpu_buffer[: int(metadata_host_buffer[batch_size * 7 + 5])].clone(),
             new_offload_startpos = metadata_host_buffer[batch_size * 5 + 4 : batch_size * 6 + 4],
             new_offload_lengths = metadata_host_buffer[batch_size * 6 + 4 : batch_size * 7 + 4],
             max_seqlen = torch.max(metadata_host_buffer[batch_size * 2 + 1 : batch_size * 3 + 1]).item(),
