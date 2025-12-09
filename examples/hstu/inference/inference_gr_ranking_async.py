@@ -53,6 +53,7 @@ sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
 log_dir = "./logs/logs_12_8"
+# log_dir = "./logs_without_kv/logs_12_8"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -370,8 +371,8 @@ def run_ranking_gr_simulate(
                     logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
                     
                     # if num_batches_ctr == 1000:
-                    if num_batches_ctr * max_batch_size >= 140000:
-                        break
+                    # if num_batches_ctr * max_batch_size >= 140000:
+                    #     break
                 except StopIteration:
                     break
         end_time = time.time()
