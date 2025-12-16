@@ -119,7 +119,7 @@ class InferenceDataset(IterableDataset[Batch]):
         #     (self._batch_logs_frame["interval_indptr"] >= 6000) &
         #     (self._batch_logs_frame["interval_indptr"] <= 10000)
         # ]
-        # # 20220507 对应的时间戳是 1651881600000
+        # 20220507 对应的时间戳是 1651881600000
         # self._batch_logs_frame = self._batch_logs_frame[
         #     (self._batch_logs_frame["interval_end_ts"] > 1651881600000) &
         #     (self._batch_logs_frame["interval_indptr"] >= 2000) &

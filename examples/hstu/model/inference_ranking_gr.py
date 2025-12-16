@@ -815,7 +815,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.synchronize()
                 timing_info['hstu_inference'] = time.time() - hstu_start
             
-            # 8. 最终化KV Cache
+            # 8. 下沉KV Cache
             if self.enable_timing_stats:
                 offload_kvcache_start = time.time()
             with nvtx.range("offload_kvcache"):
