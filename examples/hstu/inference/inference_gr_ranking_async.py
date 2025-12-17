@@ -52,8 +52,8 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_12_16"
-# log_dir = "./logs_without_kv/logs_12_8"
+# log_dir = "./logs/logs_12_17"
+log_dir = "./logs_without_kv/logs_12_17"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -193,10 +193,11 @@ def get_inference_hstu_model(
         # "blocks_in_primary_pool": 10240,
         "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,
-        "offload_chunksize": 4096,
+        "offload_chunksize": 2048,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
+    logger.info(f"offload_chunksize: {kvcache_args['offload_chunksize']}")
     kv_cache_config = get_kvcache_config(**kvcache_args)
 
     ranking_args = RankingArgs()
@@ -302,7 +303,7 @@ def run_ranking_gr_simulate(
         num_batches_ctr = 0
         start_time = time.time()
         cur_date = None
-        torch.cuda.memory._record_memory_history(max_entries=100000)
+        # torch.cuda.memory._record_memory_history(max_entries=100000)
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
             schedule = torch.profiler.schedule(
@@ -319,10 +320,10 @@ def run_ranking_gr_simulate(
             while True:
                 try:
                     num_batches_ctr += 1
-                    if num_batches_ctr == 40:
-                       torch.cuda.memory._dump_snapshot(f"hstu_model.pickle")
-                       torch.cuda.memory._record_memory_history(enabled=None)
-                       break
+                    # if num_batches_ctr == 2:
+                    #    torch.cuda.memory._dump_snapshot(f"hstu_model.pickle")
+                    #    torch.cuda.memory._record_memory_history(enabled=None)
+                    #    break
                     if num_batches_ctr == 1000:
                         start_time = time.time()
                     uids, dates, seq_endptrs = next(dataloader_iter)

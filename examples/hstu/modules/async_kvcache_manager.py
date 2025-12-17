@@ -234,3 +234,6 @@ class AsyncHSTUKVCacheManager:
     def sync_onload_buffer_to_cache(self, user_ids):
         user_id_list = user_ids.tolist()
         paged_kvcache_ops.sync_onload_buffer_to_cache(self.gpu_kvcache_mgr, user_id_list)
+    
+    def synchronize_sync_stream(self):
+        paged_kvcache_ops.synchronize_sync_stream(self.gpu_kvcache_mgr)

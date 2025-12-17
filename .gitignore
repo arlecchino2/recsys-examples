@@ -33,5 +33,5 @@ embedding_checkpoint/
 pcie_lookup_poc/*
 dist/
 scripts/
-tensorrt-llm-kvcache
+tensorrt-llm-kvcache/*
 *log*/
