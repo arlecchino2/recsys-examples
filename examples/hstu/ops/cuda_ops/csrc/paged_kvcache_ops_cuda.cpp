@@ -813,10 +813,10 @@ public:
                     
                     cudaCheck(cudaMemcpyAsync(gpu_onload_buffer + onload_offsets[seq_idx] * this->per_token_kv_stride + chunk_idx * host_kv_mgr->chunk_numel, 
                         onload_pinned_buffers[task_idx%2], host_kv_mgr->chunk_numel * sizeof(uint16_t), cudaMemcpyHostToDevice, this->onload_stream));
-                    cudaCheck(cudaEventRecord(offload_memcpy_event[task_idx%2], this->onload_stream));
+                    cudaCheck(cudaEventRecord(onload_memcpy_event[task_idx%2], this->onload_stream));
 
                     if (task_idx > 0) {
-                        cudaCheck(cudaEventSynchronize(offload_memcpy_event[(task_idx - 1)%2]));
+                        cudaCheck(cudaEventSynchronize(onload_memcpy_event[(task_idx - 1)%2]));
                     }
 
 
