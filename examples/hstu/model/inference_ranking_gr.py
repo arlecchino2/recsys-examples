@@ -32,6 +32,7 @@ from modules.jagged_data import JaggedData
 from modules.mlp import MLP
 from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
 from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
+from modules.quant_async_kvcache_manager import QuantizedAsyncHSTUKVCacheManager
 import math
 import time
 
@@ -171,7 +172,7 @@ class InferenceRankingGR(torch.nn.Module):
             max_batch_size, max_seq_len, hstu_config.contextual_max_seqlen
         )
         
-        self.async_kvcache = AsyncHSTUKVCacheManager(
+        self.async_kvcache = QuantizedAsyncHSTUKVCacheManager(
             hstu_config.num_layers,
             hstu_config.num_heads,
             hstu_config.head_dim,
