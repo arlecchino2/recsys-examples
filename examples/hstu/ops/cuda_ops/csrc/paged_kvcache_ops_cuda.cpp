@@ -27,6 +27,8 @@
 #include <torch/extension.h>
 #include <torch/serialize/tensor.h>
 
+#include <barrier>
+#include <iomanip>
 #include <iostream>
 #include <list>
 #include <memory>
@@ -36,6 +38,8 @@
 #include <unordered_map>
 #include <vector>
 #include <chrono>
+
+#include <nvtx3/nvtx3.hpp>
 
 #define cudaCheck(ans) { cudaSuccesAssert((ans), __FILE__, __LINE__); }
 inline void cudaSuccesAssert(cudaError_t code, const char *file, int line, bool abort=true)
@@ -394,6 +398,11 @@ public:
         size_t layer_numel;
 };
 
+// class PinnedDoubleBuffer {
+// public:
+// public:
+// };
+
 class KVOnloadHandle {
 public:
     KVOnloadHandle(
@@ -428,9 +437,9 @@ public:
     }
 
     void complete_host(int layer_idx, cudaStream_t stream) {
+        cudaEventRecord(event[layer_idx], stream);
         {
             std::unique_lock<std::mutex> lock(mtx_);
-            cudaEventRecord(event[layer_idx], stream);
             host_complete[layer_idx] = 1;
         }
         cv_.notify_one();
@@ -503,6 +512,7 @@ public:
      , onload_memcpy_event(2)
      , offload_pinned_buffers(2)
      , offload_memcpy_event(2)
+     , onload_memcpy_barrier_(std::barrier<>(3 + 1))
     {
         const c10::cuda::OptionalCUDAGuard device_guard(this->device);
 
@@ -512,6 +522,7 @@ public:
         page_stride = 2 * num_tokens_per_page * num_kv_heads * kv_headdim;
         k2v_stride = num_tokens_per_page * num_kv_heads * kv_headdim;
         layer_stride = (num_primary_cache_pages + num_onload_buffer_pages) * page_stride;
+
         per_token_kv_stride = 2 * num_kv_heads * kv_headdim;
 
         cudaStreamCreate(&worker_stream);
@@ -538,6 +549,7 @@ public:
                 &GPUKVCacheMangerImpl::onload_host_memcpy_loop, this 
             ));
         }
+        // ;
 
         this->num_offload_memcpy_worker = 3;
         for (int i = 0; i < num_offload_memcpy_worker; i++) {
@@ -579,18 +591,29 @@ public:
         }
     }
 
-        int64_t getUIdToEvict(std::unordered_set<int64_t> freezed_uids) {
-            if (freezed_uids.size() == 0)
-                return _lru_list.back();
-        
-            for (auto it = std::rbegin(_lru_list); it != std::rend(_lru_list); ++it) {
-                if (freezed_uids.find((int64_t)*it) != freezed_uids.end())
-                    continue;
-                return *it;
+    int64_t getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {
+        while (true) {
+            int num_offloading_uids = 0;
+            {
+                std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
+                num_offloading_uids = offload_freezed_uids_.size();
+                // std::cout << "Saw " << num_offloading_uids << " freezed for offloading" << std::endl;
+
+                for (auto it = std::rbegin(_lru_list); it != std::rend(_lru_list); ++it) {
+                    if (offload_freezed_uids_.find((int64_t)*it) != offload_freezed_uids_.end())
+                        continue;
+                    if (extra_freezed_uids.find((int64_t)*it) != extra_freezed_uids.end())
+                        continue;
+                    return *it;
+                }
             }
-            assert(false);
-            return _lru_list.back();
-        };
+            if (num_offloading_uids == 0) assert(false);
+            
+            std::this_thread::yield();
+        }
+
+        return _lru_list.back();
+    };
 
         std::vector<int32_t>& alloc(int64_t uid, int new_total_length, std::unordered_set<int64_t> freezed_uids) {
             int cur_cached_start = 0;
@@ -794,13 +817,14 @@ public:
             // std::cout << "onload_kvcache empty" << std::endl << std::flush;
             return;
         }
+        // std::cout << "[Onload Launch] {" << user_ids[0] << "}: " << onload_length[0] << std::endl;
 
         const size_t chunk_numel_part = host_kv_mgr->chunk_numel / (this->num_onload_memcpy_worker + 1);
 
+        int task_idx = 0;
         for (int layer_idx = 0; layer_idx < this->num_layers; layer_idx++) {
             uint16_t *gpu_onload_buffer = this->get_cache_table_by_layer(layer_idx) + this->num_primary_cache_pages * this->page_stride;
 
-            int task_idx = 0;
             for (int seq_idx = 0; seq_idx < batch_size; seq_idx++) {
                 std::vector<uint16_t *> chunk_ptrs = host_kv_mgr->get_kvdata_v2(user_ids[0], onload_length[0], layer_idx);
                 
@@ -819,7 +843,6 @@ public:
                         cudaCheck(cudaEventSynchronize(onload_memcpy_event[(task_idx - 1)%2]));
                     }
 
-
                     task_idx++;
                 }
             }
@@ -837,14 +860,31 @@ public:
         at::Tensor new_offload_startpos,  // host
         at::Tensor new_offload_lengths)   // host
     {
+        const size_t num_offload_uids = offload_user_ids.numel();
+        std::vector<int> offload_host_metadata(4*num_offload_uids);
+
+        std::memcpy((void*)offload_host_metadata.data(), 
+                    (void*)offload_user_ids.data_ptr(), num_offload_uids * sizeof(int64_t));
+        std::memcpy(offload_host_metadata.data() + num_offload_uids * 2, 
+                    new_offload_startpos.data_ptr(), num_offload_uids * sizeof(int));
+        std::memcpy(offload_host_metadata.data() + num_offload_uids * 3, 
+                    new_offload_lengths.data_ptr(), num_offload_uids * sizeof(int));
+        
+        {
+            std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
+            int64_t *offload_uids = reinterpret_cast<int64_t*>(offload_host_metadata.data());
+            for (int idx = 0; idx < num_offload_uids; idx++) {
+                int cur_freezed_times = offload_freezed_uids_[offload_uids[idx]];
+                offload_freezed_uids_[offload_uids[idx]] = cur_freezed_times + 1;
+                // std::cout << "Freezing " << offload_uids[idx] << " from " << cur_freezed_times << " to " << (cur_freezed_times + 1) << std::endl;
+            }
+        }
         {
             std::unique_lock<std::mutex> lock(offload_task_mutex_);
             offload_task_queue.push(std::make_tuple(
-                offload_user_ids, 
+                offload_host_metadata,
                 offload_page_ids, 
                 gather_kv_gpu_buffer, 
-                new_offload_startpos, 
-                new_offload_lengths, 
                 offload_handle.ready_event
             ));
         }
@@ -857,9 +897,10 @@ public:
 
 private:
     void onload_host_memcpy(void* dst, void* src, size_t bytes, size_t bytes_part) {
+        NVTX3_FUNC_RANGE();
         {
             std::unique_lock<std::mutex> lock(onload_memcpy_task_mtx_);
-            this->onload_memcpy_cmplt_flag = 0;
+            // this->onload_memcpy_cmplt_flag = 0;
             for (int i = 1; i < (this->num_onload_memcpy_worker + 1); i++)
                 onload_memcpy_task_queue.push(std::make_tuple(
                     (reinterpret_cast<char *>(dst) + i * bytes_part),
@@ -870,12 +911,13 @@ private:
         onload_memcpy_task_cv_.notify_all();
         std::memcpy(dst, src, bytes_part);
 
-        {
-            std::unique_lock<std::mutex> lock(onload_memcpy_cmplt_mtx_);
-            onload_memcpy_cmplt_cv_.wait(lock, [this] {
-                return this->onload_memcpy_cmplt_flag == this->num_onload_memcpy_worker || this->terminate_;
-            });
-        }
+        // {
+        //     std::unique_lock<std::mutex> lock(onload_memcpy_cmplt_mtx_);
+        //     onload_memcpy_cmplt_cv_.wait(lock, [this] {
+        //         return this->onload_memcpy_cmplt_flag == this->num_onload_memcpy_worker || this->terminate_;
+        //     });
+        // }
+        onload_memcpy_barrier_.arrive_and_wait();
     }
 
     void onload_host_memcpy_loop() {
@@ -892,16 +934,18 @@ private:
                 onload_memcpy_task_queue.pop();
             }
             std::memcpy(dst, src, bytes);
-            {
-                std::unique_lock<std::mutex> lock(onload_memcpy_cmplt_mtx_);
-                onload_memcpy_cmplt_flag += 1;
-                if (onload_memcpy_cmplt_flag == this->num_onload_memcpy_worker)
-                    onload_memcpy_cmplt_cv_.notify_one();
-            }
+            // {
+            //     std::unique_lock<std::mutex> lock(onload_memcpy_cmplt_mtx_);
+            //     onload_memcpy_cmplt_flag += 1;
+            //     if (onload_memcpy_cmplt_flag == this->num_onload_memcpy_worker)
+            //         onload_memcpy_cmplt_cv_.notify_one();
+            // }
+            onload_memcpy_barrier_.arrive_and_wait();
         }
     }
 
     void offload_host_memcpy(void* dst, void* src, size_t bytes, size_t bytes_part) {
+        NVTX3_FUNC_RANGE();
         {
             std::unique_lock<std::mutex> lock(offload_memcpy_task_mtx_);
             this->offload_memcpy_cmplt_flag = 0;
@@ -951,34 +995,50 @@ private:
         const c10::cuda::OptionalCUDAGuard device_guard(this->device);
 
         while (true) {
-            
-            at::Tensor offload_user_ids, offload_page_ids, gather_kv_gpu_buffer, new_offload_startpos, new_offload_lengths;
+            std::vector<int> host_metadata;
+            at::Tensor offload_page_ids, gather_kv_gpu_buffer;
             cudaEvent_t offload_gpu_acq_event;
-
             {
+                nvtx3::scoped_range r{"offload_prelogue"};
+
                 std::unique_lock<std::mutex> lock(offload_task_mutex_);
                 offload_task_cv_.wait(lock, [this] {
                     return !offload_task_queue.empty() || this->terminate_;
                 });
                 if (this->terminate_) {
-                    return;
+                    break;
                 }
 
-                std::tie(
-                    offload_user_ids, offload_page_ids, gather_kv_gpu_buffer, new_offload_startpos, new_offload_lengths, offload_gpu_acq_event
-                ) = offload_task_queue.front();
-                offload_task_queue.pop();
+                {
+                    nvtx3::scoped_range r1{"offload_prelogue unpack_input"};
+
+                    std::tie(
+                        host_metadata, offload_page_ids, gather_kv_gpu_buffer, offload_gpu_acq_event
+                    ) = offload_task_queue.front();
+                }
+                {
+                    nvtx3::scoped_range r2{"offload_prelogue pop"};
+                    offload_task_queue.pop();
+                }
 
                 this->offload_busy_.store(true);
             }
+
+            int64_t *offload_uids = reinterpret_cast<int64_t *>(host_metadata.data());
             uint16_t *gather_kv_gpu_buffer_data_ptr = static_cast<uint16_t*>(gather_kv_gpu_buffer.data_ptr());
-            int num_offload_pages = offload_page_ids.numel();
+            const int num_offload_uids = host_metadata.size() / 4;
+            const int num_offload_pages = offload_page_ids.numel();
             size_t gather_layer_stride = num_offload_pages * this->page_stride;
 
-            // std::cout << "[Offload Launch]: waiting event" << std::endl;
+            int64_t dbg_uid;
+            {
+                int64_t *offload_uids = reinterpret_cast<int64_t *>(host_metadata.data());
+                dbg_uid = offload_uids[0];
+            }
+            // std::cout << "[Offload Launch] {" << dbg_uid << "}: waiting event" << std::endl;
             cudaStreamWaitEvent(this->offload_stream, offload_gpu_acq_event);
             cudaEventDestroy(offload_gpu_acq_event);
-            // std::cout << "[Offload Launch]: waited event" << std::endl;
+            // std::cout << "[Offload Launch] {" << dbg_uid << "}: waited event" << std::endl;
 
             // gather
             gather_paged_kv_cache_all_layers(
@@ -997,7 +1057,21 @@ private:
                 this->kv_headdim,
                 num_offload_pages,
                 this->offload_stream);
+            cudaStreamSynchronize(this->offload_stream);
             // release on gpu kvcache
+            {
+                std::unique_lock<std::mutex> lock(offload_freezed_uids_mtx_);
+                for (int idx = 0; idx < num_offload_uids; idx++) {
+                    int cur_freezed_times = offload_freezed_uids_[offload_uids[idx]];
+                    if (cur_freezed_times == 1) {
+                        offload_freezed_uids_.erase(offload_uids[idx]);
+                    } else {
+                        offload_freezed_uids_[offload_uids[idx]] = cur_freezed_times - 1;
+                    }
+                    // std::cout << "Released " << offload_uids[idx] << " from " << cur_freezed_times << " to " << (cur_freezed_times - 1) << std::endl;
+                }
+            }
+            // std::cout << "[Offload Launch] {" << dbg_uid << "}: gathered gpu" << std::endl;
             // skipped
 
             size_t pinned_bytes = this->num_layers * gather_layer_stride * sizeof(uint16_t);
@@ -1032,23 +1106,30 @@ private:
                     host_kv_mgr->chunk_numel * sizeof(uint16_t),
                     chunk_numel_part * sizeof(uint16_t));
             }
+            // std::cout << "[Offload Launch] {" << dbg_uid << "}: copied data" << std::endl;
 
             // bookkeepping int host kv storage
-            size_t page_offset = 0;
-            int* offload_startpos = static_cast<int *>(new_offload_startpos.data_ptr());
-            int* offload_lengths = static_cast<int *>(new_offload_lengths.data_ptr());
+            {
+                nvtx3::scoped_range r{"offload_epilogue"};
+                {
+                    nvtx3::scoped_range r1{"offload_bookkeeping"};
 
-            const int offload_batch_size = offload_user_ids.numel();
-            for (int seq_idx = 0; seq_idx < offload_batch_size; seq_idx++) {
-                int64_t uid = static_cast<int64_t*>(offload_user_ids.data_ptr())[seq_idx];
-                uint16_t *input_ptr = host_kv_ptr + page_offset * this->page_stride;
-                host_kv_mgr->append_kvdata_v2(uid, offload_startpos[seq_idx], offload_lengths[seq_idx], input_ptr, gather_layer_stride);
-                this->_uid_to_offloaded_length[uid] = offload_startpos[seq_idx] + offload_lengths[seq_idx];
-                page_offset += offload_lengths[seq_idx] / this->num_tokens_per_page;
+                    size_t page_offset = 0;
+                    int* offload_startpos = reinterpret_cast<int *>(host_metadata.data() + num_offload_uids * 2);
+                    int* offload_lengths = reinterpret_cast<int *>(host_metadata.data() + num_offload_uids * 3);
+
+                    for (int seq_idx = 0; seq_idx < num_offload_uids; seq_idx++) {
+                        int64_t uid = offload_uids[seq_idx];
+                        uint16_t *input_ptr = host_kv_ptr + page_offset * this->page_stride;
+                        host_kv_mgr->append_kvdata_v2(uid, offload_startpos[seq_idx], offload_lengths[seq_idx], input_ptr, gather_layer_stride);
+                        this->_uid_to_offloaded_length[uid] = offload_startpos[seq_idx] + offload_lengths[seq_idx];
+                        page_offset += offload_lengths[seq_idx] / this->num_tokens_per_page;
+                    }
+                }
+
+                this->offload_busy_.store(false);
             }
-
-            this->offload_busy_.store(false);
-            // std::cout << "offload kvcache finish one" << std::endl << std::flush;
+            // std::cout << "[Offload Launch] {" << dbg_uid << "}: offloading finish" << std::endl;
         }
     }
 
@@ -1088,13 +1169,15 @@ public:
     std::mutex onload_memcpy_task_mtx_;
     std::condition_variable onload_memcpy_task_cv_;
 
-    int onload_memcpy_cmplt_flag;
-    std::mutex onload_memcpy_cmplt_mtx_;
-    std::condition_variable onload_memcpy_cmplt_cv_;
+    // int onload_memcpy_cmplt_flag;
+    // std::mutex onload_memcpy_cmplt_mtx_;
+    // std::condition_variable onload_memcpy_cmplt_cv_;
+    
+    std::barrier<> onload_memcpy_barrier_;
 
     std::thread offload_worker;
 
-    std::queue<std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, cudaEvent_t>> offload_task_queue;
+    std::queue<std::tuple<std::vector<int>, at::Tensor, at::Tensor, cudaEvent_t>> offload_task_queue;
     std::mutex offload_task_mutex_;
     std::condition_variable offload_task_cv_;
 
@@ -1110,6 +1193,9 @@ public:
     int offload_memcpy_cmplt_flag;
     std::mutex offload_memcpy_cmplt_mtx_;
     std::condition_variable offload_memcpy_cmplt_cv_;
+
+    std::unordered_map<int64_t, int> offload_freezed_uids_;
+    std::mutex offload_freezed_uids_mtx_;
 
     bool terminate_;
     std::atomic<bool> offload_busy_;
@@ -1187,13 +1273,12 @@ void prepare_kvcache(
             //       << " gpu_cache_length=" << gpu_cache_length
             //       << " page_ids.size=" << page_ids.size() << std::endl;
 
-            int num_onload_pages = gpu_cache_startpos / gpu_mgr.num_tokens_per_page;
-            // std::cout << "[DEBUG] User " << uid << " num_onload_pages=" << num_onload_pages << std::endl;
-            for (int i = 0; i < num_onload_pages; i++) page_indices.push_back(onload_page_offset+i);
-            page_indices.insert(page_indices.end(), page_ids.begin(), page_ids.end());
-            page_indptr[seq_idx + 1] = page_indptr[seq_idx] + page_ids.size();
-            last_page_len[seq_idx] = gpu_cache_length % gpu_mgr.num_tokens_per_page;
-            onload_page_offset += num_onload_pages;
+        int num_onload_pages = gpu_cache_startpos / gpu_mgr.num_tokens_per_page;
+        for (int i = 0; i < num_onload_pages; i++) page_indices.push_back(onload_page_offset+i);
+        page_indices.insert(page_indices.end(), page_ids.begin(), page_ids.end());
+        page_indptr[seq_idx + 1] = page_indptr[seq_idx] + page_ids.size() + num_onload_pages;
+        last_page_len[seq_idx] = gpu_cache_length % gpu_mgr.num_tokens_per_page;
+        onload_page_offset += num_onload_pages;
 
             total_history_lengths[seq_idx] = total_history_length;
             total_history_offsets[seq_idx + 1] = total_history_offsets[seq_idx] + total_history_length;

@@ -193,7 +193,7 @@ def get_inference_hstu_model(
         # "blocks_in_primary_pool": 10240,
         "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,
-        "offload_chunksize": 1024,
+        "offload_chunksize": 1024, 
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -228,7 +228,7 @@ def get_inference_hstu_model(
         model.bfloat16()
     elif hstu_config.fp16:
         model.half()
-    # model.load_checkpoint(checkpoint_dir)
+    model.load_checkpoint(checkpoint_dir)
     model.eval()
 
     return model
@@ -402,7 +402,7 @@ def run_ranking_gr_evaluate(
         else 0
     )
 
-    max_batch_size = 8
+    max_batch_size = 1
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
@@ -447,7 +447,7 @@ def run_ranking_gr_evaluate(
             metric_types=model._task_config.eval_metrics,
         )
 
-        _, eval_dataset = get_dataset(
+        eval_dataset, _ = get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
             max_sequence_length=dataset_args.max_sequence_length,
@@ -480,6 +480,7 @@ def run_ranking_gr_evaluate(
                     batch = strip_padding_batch(batch, user_ids.shape[0])
                 total_history_lengths = torch.sum(batch.features.lengths().view(-1, batch.batch_size), 0).view(-1) - batch.num_candidates
                 total_history_lengths = total_history_lengths.cpu()
+                print(batch.features.lengths())
                 
                 if not disable_kvcache:
                     logits = model.forward(batch, user_ids, total_history_lengths)

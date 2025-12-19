@@ -691,8 +691,7 @@ class InferenceRankingGR(torch.nn.Module):
                     total_history_lengths.tolist(),
                     self.async_kvcache.static_page_ids_gpu_buffer,
                     self.async_kvcache.static_offload_page_ids_gpu_buffer,
-                    self.async_kvcache.static_pinned_kv_buffer,
-                    self.async_kvcache.static_onload_handle,
+                        self.async_kvcache.static_onload_handle,
                 )
                 (
                     old_cached_lengths,
