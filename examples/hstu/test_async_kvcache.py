@@ -3,6 +3,7 @@ import torch
 import math
 from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
 import random
+import time
 
 def forward(
         async_kvcache,
@@ -20,7 +21,6 @@ def forward(
                 total_history_lengths.tolist(),
                 async_kvcache.static_page_ids_gpu_buffer,
                 async_kvcache.static_offload_page_ids_gpu_buffer,
-                async_kvcache.static_pinned_kv_buffer,
                 async_kvcache.static_onload_handle,
             )
             # print("[DEBUG] return from trigger\n", flush=True)
@@ -80,7 +80,7 @@ if __name__ == "__main__":
         }
         kvc_mgr = AsyncHSTUKVCacheManager(**kwargs)
 
-        max_num_users = 10
+        max_num_users = 50
         user_ids_pool = list(range(max_num_users))
 
         init_user_ids = list(user_ids_pool)
@@ -115,9 +115,15 @@ if __name__ == "__main__":
         #     print(uid, kvc_mgr.gpu_kvcache_mgr.get_total_cache_length([uid]))
 
         running_batch_size = 1
-        for ind in range(0, len(init_user_ids), running_batch_size):
+        appending_user_ids = list(init_user_ids)
+        random.shuffle(appending_user_ids)
+        appending_user_ids = appending_user_ids[:10]
+
+        # torch.cuda.profiler.start()
+
+        for ind in range(0, len(appending_user_ids), running_batch_size):
             batch_size = running_batch_size
-            user_ids = init_user_ids[ind:ind+batch_size]
+            user_ids = appending_user_ids[ind:ind+batch_size]
             total_history_lengths = [ 6200 for _ in user_ids ]
 
             user_ids = torch.tensor(user_ids, dtype=torch.int64)

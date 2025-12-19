@@ -545,7 +545,6 @@ class InferenceRankingGR(torch.nn.Module):
                 total_history_lengths.tolist(),
                 self.async_kvcache.static_page_ids_gpu_buffer,
                 self.async_kvcache.static_offload_page_ids_gpu_buffer,
-                self.async_kvcache.static_pinned_kv_buffer,
                 self.async_kvcache.static_onload_handle,
             )
             # print("[DEBUG] return from trigger\n", flush=True)
@@ -572,8 +571,6 @@ class InferenceRankingGR(torch.nn.Module):
                 batch=striped_batch,
                 seq_start_position=old_cached_lengths.cuda(),
             )
-            # print("[DEBUG] end of preprocessor\n", flush=True)
-
 
             kvcache_metadata = self.async_kvcache.prepare_kvcache_wait(
                 onload_fut,

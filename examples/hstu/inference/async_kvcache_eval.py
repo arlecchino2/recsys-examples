@@ -18,6 +18,7 @@ import math
 import sys
 import time
 import os
+import shutil
 
 import gin
 import torch
@@ -40,6 +41,8 @@ from utils import DatasetArgs, NetworkArgs, RankingArgs
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
+import modules.paged_hstu_infer_layer as pg
+from modules.paged_hstu_infer_layer import init
 
 class RunningMode(enum.Enum):
     EVAL = "eval"
@@ -49,9 +52,7 @@ class RunningMode(enum.Enum):
         return self.value
 
 
-def get_inference_dataset_and_embedding_configs(
-    disable_contextual_features: bool = False,
-):
+def get_inference_dataset_and_embedding_configs():
     dataset_args = DatasetArgs()
     embedding_dim = NetworkArgs().hidden_size
     HASH_SIZE = 10_000_000
@@ -114,12 +115,7 @@ def get_inference_dataset_and_embedding_configs(
                 use_dynamicemb=False,
             ),
         ]
-        return (
-            dataset_args,
-            embedding_configs
-            if not disable_contextual_features
-            else embedding_configs[-2:],
-        )
+        return dataset_args, embedding_configs
 
     raise ValueError(f"dataset {dataset_args.dataset_name} is not supported")
 
@@ -200,131 +196,47 @@ def get_inference_hstu_model(
     return model
 
 
-def run_ranking_gr_simulate(
-    checkpoint_dir: str,
-    check_auc: bool = False,
-    disable_contextual_features: bool = False,
-    disable_kvcache: bool = False,
-    max_bs: int = 1,
+def get_new_batch(
+    batch, hist_lengths, ratio, num_contextuals
 ):
-    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
-        disable_contextual_features
-    )
+    partial_lengths = torch.ceil(hist_lengths * ratio).long() - num_contextuals
+    partial_lengths = partial_lengths // 2
 
-    dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
-    num_contextual_features = (
-        len(dataproc._contextual_feature_names)
-        if not disable_contextual_features
-        else 0
-    )
+    kjt_dict = batch.features.to_dict()
+    item_jt = kjt_dict["video_id"]
+    vals = item_jt.values()
+    lens = item_jt.lengths()
+    num_candidates = batch.num_candidates
+    split_lens = torch.stack(
+        [partial_lengths + num_candidates, lens - partial_lengths - num_candidates], dim=1
+    ).reshape((-1,))
+    stripped_vals = torch.split(vals, split_lens.tolist())[::2]
+    kjt_dict["video_id"] = JaggedTensor.from_dense(stripped_vals)
 
-    max_batch_size = max_bs
-    total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
-    print("total_max_seqlen", total_max_seqlen)
+    action_jt = kjt_dict["action_weights"]
+    vals = action_jt.values()
+    lens = action_jt.lengths()
+    split_lens = torch.stack(
+        [partial_lengths, lens - partial_lengths], dim=1
+    ).reshape((-1,))
+    stripped_vals = torch.split(vals, split_lens.tolist())[::2]
+    kjt_dict["action_weights"] = JaggedTensor.from_dense(stripped_vals)
 
-    with torch.inference_mode():
-        model = get_inference_hstu_model(
-            emb_configs,
-            max_batch_size,
-            num_contextual_features,
-            total_max_seqlen,
-            checkpoint_dir,
-        )
+    batch.features = KeyedJaggedTensor.from_jt_dict(kjt_dict)
+    hist_lengths = num_contextuals + partial_lengths * 2
 
-        if check_auc:
-            eval_module = get_multi_event_metric_module(
-                num_classes=model._task_config.prediction_head_arch[-1],
-                num_tasks=model._task_config.num_tasks,
-                metric_types=model._task_config.eval_metrics,
-            )
-
-        dataset = InferenceDataset(
-            seq_logs_file=dataproc._inference_sequence_file,
-            batch_logs_file=dataproc._inference_batch_file,
-            batch_size=max_batch_size,
-            max_seqlen=dataset_args.max_sequence_length,
-            item_feature_name=dataproc._item_feature_name,
-            contextual_feature_names=dataproc._contextual_feature_names
-            if not disable_contextual_features
-            else [],
-            action_feature_name=dataproc._action_feature_name,
-            max_num_candidates=dataset_args.max_num_candidates,
-            item_vocab_size=10_000_000,
-            userid_name="user_id",
-            date_name="date",
-            sequence_endptr_name="interval_indptr",
-            timestamp_names=["date", "interval_end_ts"],
-        )
-
-        dataloader = get_data_loader(dataset=dataset)
-        dataloader_iter = iter(dataloader)
-
-        num_batches_ctr = 0
-        start_time = time.time()
-        cur_date = None
-        while True:
-            try:
-                uids, dates, seq_endptrs = next(dataloader_iter)
-                if dates[0] != cur_date:
-                    # if cur_date is not None:
-                        # eval_metric_dict = eval_module.compute()
-                        # print(
-                        #     f"[eval]:\n    "
-                        #     + stringify_dict(
-                        #         eval_metric_dict, prefix="Metrics", sep="\n    "
-                        #     )
-                        # )
-                    # model.clear_kv_cache()
-                    if cur_date is not None:
-                        break
-                    cur_date = dates[0]
-
-                batch = dataset.get_input_batch(
-                    uids,
-                    dates,
-                    seq_endptrs,
-                    torch.zeros_like(seq_endptrs),
-                    with_contextual_features=True,
-                    with_ranking_labels=False,
-                )
-                total_history_lengths = seq_endptrs * 2 + num_contextual_features
-                
-                if batch is not None:
-                    if not disable_kvcache:
-                        logits = model.forward(
-                            batch,
-                            uids,
-                            total_history_lengths,
-                        )
-                    else:
-                        logits = model.forward_nokvcache(batch)
-                    # eval_module(logits, batch.labels)
-
-                num_batches_ctr += 1
-                # if num_batches_ctr == 1000:
-                #     break
-            except StopIteration:
-                break
-        end_time = time.time()
-        print("Total #batch:", num_batches_ctr)
-        print("Total time(s):", end_time - start_time)
+    return batch, hist_lengths
+    
 
 
-def run_ranking_gr_evaluate(
+def run_kvcache_consistency_check(
     checkpoint_dir: str,
-    disable_contextual_features: bool = False,
     disable_kvcache: bool = False,
 ):
-    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
-        disable_contextual_features
-    )
+    dataset_args, emb_configs = get_inference_dataset_and_embedding_configs()
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
-    num_contextual_features = (
-        len(dataproc._contextual_feature_names)
-        if not disable_contextual_features
-        else 0
-    )
+    num_contextual_features = len(dataproc._contextual_feature_names)
 
     max_batch_size = 1
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
@@ -371,7 +283,7 @@ def run_ranking_gr_evaluate(
             metric_types=model._task_config.eval_metrics,
         )
 
-        eval_dataset, _ = get_dataset(
+        train_dataset, _ = get_dataset(
             dataset_name=dataset_args.dataset_name,
             dataset_path=dataset_args.dataset_path,
             max_sequence_length=dataset_args.max_sequence_length,
@@ -385,74 +297,96 @@ def run_ranking_gr_evaluate(
             eval_batch_size=max_batch_size,
         )
 
-        dataloader = get_data_loader(dataset=eval_dataset)
-        dataloader_iter = iter(dataloader)
+        dataloader = get_data_loader(dataset=train_dataset)
 
+        num_kvc_test_rounds = 2
+        
+        # torch.cuda.memory._record_memory_history()
         # torch.cuda.profiler.start()
-        while True:
-            try:
-                batch = next(dataloader_iter)
-                if model._task_config.num_tasks > 0:
-                    batch = strip_candidate_action_tokens(
-                        batch, dataproc._action_feature_name
-                    )
+        for round_id in [0, 1]:
+            dataloader_iter = iter(dataloader)
 
-                batch = batch.to(device=torch.cuda.current_device())
-                d = batch.features.to_dict()
-                user_ids = d["user_id"].values().cpu().long()
-                if user_ids.shape[0] != batch.batch_size:
-                    batch = strip_padding_batch(batch, user_ids.shape[0])
-                total_history_lengths = torch.sum(batch.features.lengths().view(-1, batch.batch_size), 0).view(-1) - batch.num_candidates
-                total_history_lengths = total_history_lengths.cpu()
-                print(batch.features.lengths())
-                
-                if not disable_kvcache:
-                    logits = model.forward(batch, user_ids, total_history_lengths)
-                else:
-                    logits = model.forward_nokvcache(batch)
-                eval_module(logits, batch.labels)
-            except StopIteration:
-                break
+            length_ratio = (round_id + 1) / num_kvc_test_rounds
+            while True:
+                try:
+                    batch = next(dataloader_iter)
+                    if model._task_config.num_tasks > 0:
+                        batch = strip_candidate_action_tokens(
+                            batch, dataproc._action_feature_name
+                        )
+                    
+                    batch = batch.to(device=torch.cuda.current_device())
+
+                    d = batch.features.to_dict()
+                    user_ids = d["user_id"].values().cpu().long()
+                    if user_ids.shape[0] != batch.batch_size:
+                        batch = strip_padding_batch(batch, user_ids.shape[0])
+                    total_history_lengths = torch.sum(batch.features.lengths().view(-1, batch.batch_size), 0).view(-1) - batch.num_candidates
+
+                    if round_id != num_kvc_test_rounds - 1:
+                        batch, total_history_lengths = get_new_batch(batch, total_history_lengths, length_ratio, num_contextual_features)
+
+                    # if int(user_ids[0]) == 0:
+                    #     pg.dmp = True
+                    if not disable_kvcache:
+                        logits = model.forward(batch, user_ids, total_history_lengths.cpu())
+                    else:
+                        logits = model.forward_nokvcache(batch)
+
+                    if pg.dmp:
+                        if disable_kvcache:
+                            for lidx in range(model._hstu_config.num_layers):
+                                if user_ids[0] < 10 or user_ids[0] >= 690:
+                                    shutil.move(f"/tmp/in_l{lidx}.npy", f"dump/round{round_id}_user{user_ids[0]}_in_l{lidx}.npy")
+                                    shutil.move(f"/tmp/key_l{lidx}.npy", f"dump/round{round_id}_user{user_ids[0]}_key_l{lidx}.npy")
+                                    shutil.move(f"/tmp/value_l{lidx}.npy", f"dump/round{round_id}_user{user_ids[0]}_value_l{lidx}.npy")
+                                    shutil.move(f"/tmp/attn_l{lidx}.npy", f"dump/round{round_id}_user{user_ids[0]}_attn_l{lidx}.npy")
+                                    shutil.move(f"/tmp/out_l{lidx}.npy", f"dump/round{round_id}_user{user_ids[0]}_out_l{lidx}.npy")
+
+                                else:
+                                    os.remove(f"/tmp/key_l{lidx}.npy")
+                                    os.remove(f"/tmp/value_l{lidx}.npy")
+                        else:
+                            for lidx in range(model._hstu_config.num_layers):
+                                if user_ids[0] < 10 or user_ids[0] >= 690:
+                                    shutil.move(f"/tmp/in_l{lidx}.npy", f"cached/round{round_id}_user{user_ids[0]}_in_l{lidx}.npy")
+                                    shutil.move(f"/tmp/key_l{lidx}.npy", f"cached/round{round_id}_user{user_ids[0]}_key_l{lidx}.npy")
+                                    shutil.move(f"/tmp/value_l{lidx}.npy", f"cached/round{round_id}_user{user_ids[0]}_value_l{lidx}.npy")
+                                    shutil.move(f"/tmp/attn_l{lidx}.npy", f"cached/round{round_id}_user{user_ids[0]}_attn_l{lidx}.npy")
+                                    shutil.move(f"/tmp/out_l{lidx}.npy", f"cached/round{round_id}_user{user_ids[0]}_out_l{lidx}.npy")
+                                else:
+                                    os.remove(f"/tmp/key_l{lidx}.npy")
+                                    os.remove(f"/tmp/value_l{lidx}.npy")
+                    pg.dmp = False
+
+                    if round_id == num_kvc_test_rounds - 1:
+                        eval_module(logits, batch.labels)
+                except StopIteration:
+                    break
         # torch.cuda.profiler.stop()
+        # torch.cuda.memory._dump_snapshot("my_snapshot.pickle")
 
         eval_metric_dict = eval_module.compute()
         print(
             f"[eval]:\n    "
             + stringify_dict(eval_metric_dict, prefix="Metrics", sep="\n    ")
         )
-
+        # print("X")
 
 if __name__ == "__main__":
+    init()
     parser = argparse.ArgumentParser(description="Inference End-to-end Example")
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
-    parser.add_argument(
-        "--mode", type=RunningMode, choices=list(RunningMode), required=True
-    )
-    parser.add_argument("--disable_auc", action="store_true")
-    parser.add_argument("--disable_context", action="store_true")
     parser.add_argument("--disable_kvcache", action="store_true")
-    parser.add_argument("--max_bs", type=int, required=True)
+    # parser.add_argument("--max_bs", type=int, required=True)
 
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
 
-    if args.mode == RunningMode.EVAL:
-        if args.disable_auc:
-            print("disable_auc is ignored in Eval mode.")
-        if args.disable_context:
-            print("disable_context is ignored in Eval mode.")
-        run_ranking_gr_evaluate(
-            checkpoint_dir=args.checkpoint_dir,
-            disable_kvcache=args.disable_kvcache,
-        )
-    elif args.mode == RunningMode.SIMULATE:
-        run_ranking_gr_simulate(
-            checkpoint_dir=args.checkpoint_dir,
-            check_auc=not args.disable_auc,
-            disable_contextual_features=args.disable_context,
-            disable_kvcache=args.disable_kvcache,
-            max_bs=args.max_bs,
-        )
+    run_kvcache_consistency_check(
+        checkpoint_dir=args.checkpoint_dir,
+        disable_kvcache=args.disable_kvcache,
+    )
     print("Finished.")

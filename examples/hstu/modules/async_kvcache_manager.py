@@ -60,10 +60,10 @@ class AsyncHSTUKVCacheManager:
 
         self.static_page_ids_gpu_buffer = torch.empty([self.max_batch_size * self.max_num_pages_per_seq,], dtype=torch.int32).cuda()
         self.static_offload_page_ids_gpu_buffer = torch.empty([self.max_batch_size * self.max_num_pages_per_seq,], dtype=torch.int32).cuda()
-        self.static_pinned_kv_buffer = torch.empty(
-            [self.num_layers, self.max_batch_size * self.max_num_pages_per_seq, 2, self.page_size, self.num_heads, self.head_dim],
-            dtype=torch.bfloat16, pin_memory=True
-        )
+        # self.static_pinned_kv_buffer = torch.empty(
+        #     [self.num_layers, self.max_batch_size * self.max_num_pages_per_seq, 2, self.page_size, self.num_heads, self.head_dim],
+        #     dtype=torch.bfloat16, pin_memory=True
+        # )
         self.static_onload_handle = paged_kvcache_ops.KVOnloadHandle(self.num_layers)
 
         self.cache_table_list = [ self.cache_table[idx] for idx in range(self.num_layers) ]
@@ -74,7 +74,7 @@ class AsyncHSTUKVCacheManager:
         total_history_lengths, 
         static_page_ids_gpu_buffer, 
         static_offload_page_ids_gpu_buffer,
-        static_pinned_kv_buffer, 
+        # static_pinned_kv_buffer, 
         static_onload_handle,
     ):
         origin_cached_lengths = self.gpu_kvcache_mgr.get_total_cache_length(user_ids)
