@@ -100,14 +100,13 @@ class AsyncHSTUKVCacheManager:
             offload_uids_buffer,
             metadata_host_buffer, metadata_gpu_buffer)
 
-        static_onload_handle.reset()
-        onload_fut = self.onload_worker.submit(self.gpu_kvcache_mgr.onload_kvcache, 
-            user_ids, static_onload_handle)
+        # static_onload_handle.reset()
+        # onload_fut = self.onload_worker.submit(self.gpu_kvcache_mgr.onload_kvcache, 
+        #     user_ids, static_onload_handle)
 
-        return origin_cached_lengths, new_tokens, offload_uids_buffer, metadata_host_buffer, metadata_gpu_buffer, kvcache_metadata_fut, onload_fut
+        return origin_cached_lengths, new_tokens, offload_uids_buffer, metadata_host_buffer, metadata_gpu_buffer, kvcache_metadata_fut
     
     def prepare_kvcache_wait(self, 
-        onload_fut,
         kvcache_metadata_fut,
         batch_size, 
         new_tokens,
@@ -117,13 +116,7 @@ class AsyncHSTUKVCacheManager:
         metadata_host_buffer, 
         metadata_gpu_buffer,
         static_onload_handle):
-        # prep_start = time.time()
-        # onload_fut.result()
-        # self.onload_time += (time.time() - prep_start)
         kvcache_metadata_fut.result()
-        # self.prepare_time += (time.time() - prep_start)
-        # print("onload time: ", self.onload_time)
-        # print("prepare time: ", self.prepare_time)
         return self.get_kvcache_metadata_from_buffer(
             batch_size,
             new_tokens,
