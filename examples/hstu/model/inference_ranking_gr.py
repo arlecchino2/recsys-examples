@@ -691,7 +691,7 @@ class InferenceRankingGR(torch.nn.Module):
                     total_history_lengths.tolist(),
                     self.async_kvcache.static_page_ids_gpu_buffer,
                     self.async_kvcache.static_offload_page_ids_gpu_buffer,
-                        self.async_kvcache.static_onload_handle,
+                    self.async_kvcache.static_onload_handle,
                 )
                 (
                     old_cached_lengths,
@@ -704,7 +704,7 @@ class InferenceRankingGR(torch.nn.Module):
                 ) = prepare_kvcache_result
                 old_cached_lengths = torch.tensor(old_cached_lengths, dtype=torch.int32)
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['prepare_kvcache_async'] = time.time() - prepare_kvcache_start
 
             # 2. 去除已缓存的token
@@ -715,7 +715,7 @@ class InferenceRankingGR(torch.nn.Module):
                     batch, old_cached_lengths,
                 )
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['strip_cached_tokens'] = time.time() - strip_cached_start
 
             # 3. Embedding计算
@@ -724,7 +724,7 @@ class InferenceRankingGR(torch.nn.Module):
             with nvtx.range("embedding"):
                 embeddings = self._embedding_collection(striped_batch.features)
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['embedding'] = time.time() - emb_start
 
             # 4. 预处理
@@ -737,7 +737,7 @@ class InferenceRankingGR(torch.nn.Module):
                     seq_start_position=old_cached_lengths.cuda(),
                 )
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['preprocessing'] = time.time() - preprocess_start
 
             # 5. 等待KV Cache准备完成
@@ -757,7 +757,7 @@ class InferenceRankingGR(torch.nn.Module):
                     self.async_kvcache.static_onload_handle,
                 )
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['prepare_kvcache_wait'] = time.time() - prepare_kvcache_wait_start
 
             # print("[DEBUG] kv_indices", kvcache_metadata.kv_indices)
@@ -796,7 +796,7 @@ class InferenceRankingGR(torch.nn.Module):
                 kvcache_metadata.max_seqlen += jagged_data.max_num_candidates
                 self.async_kvcache.sync_onload_buffer_to_cache(user_ids)
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['update_metadata'] = time.time() - update_metadata_start
 
             # 7. HSTU推理
@@ -813,7 +813,7 @@ class InferenceRankingGR(torch.nn.Module):
                 )
                 jagged_data.values = hstu_output
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['hstu_inference'] = time.time() - hstu_start
             
             # 8. 下沉KV Cache
@@ -824,7 +824,7 @@ class InferenceRankingGR(torch.nn.Module):
                 # kvcache_metadata.kv_offload_handle.record_ready()
                 # fut = self.async_kvcache.finalize_kvcache(kvcache_metadata)
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['offload_kvcache'] = time.time() - offload_kvcache_start
 
             # 9. 后处理和MLP
@@ -836,7 +836,7 @@ class InferenceRankingGR(torch.nn.Module):
                 self.async_kvcache.synchronize_sync_stream()
                 
             if self.enable_timing_stats:
-                # torch.cuda.synchronize()
+                torch.cuda.synchronize()
                 timing_info['postprocess_and_mlp'] = time.time() - postprocess_start
                 timing_info['total_time'] = time.time() - start_time
 

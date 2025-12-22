@@ -24,6 +24,8 @@ nvcc_flags = [
     "--use_fast_math",
 ]
 
+NVTX_INCLUDE_DIR = "/workdir/tools/NVTX/c/include"
+
 setup(
     name="hstu_cuda_ops",
     description="HSTU CUDA ops",
@@ -49,6 +51,7 @@ setup(
                 "cxx": ["-O3", "-std=c++20", "-fvisibility=hidden"],
                 "nvcc": nvcc_threads_args() + nvcc_flags,
             },
+            include_dirs=[NVTX_INCLUDE_DIR],
         ),
     ],
     cmdclass={"build_ext": BuildExtension},
