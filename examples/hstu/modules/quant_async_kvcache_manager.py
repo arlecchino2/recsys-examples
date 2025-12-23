@@ -3,6 +3,10 @@ import torch.nn as nn
 import numpy as np
 from typing import Tuple, List
 import math
+from concurrent.futures import ThreadPoolExecutor
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from configs import KVCacheMetadata
+import os
 
 from .async_kvcache_manager import AsyncHSTUKVCacheManager
 import paged_kvcache_ops
@@ -261,39 +265,43 @@ class RandomRotationLVQ4BitQuantizer:
 # ============ 修改AsyncHSTUKVCacheManager以集成量化 ============
 
 class QuantizedAsyncHSTUKVCacheManager(AsyncHSTUKVCacheManager):
-    """支持4-bit量化的KV Cache管理器"""
-    
+    """支持2-bit量化的KV Cache管理器"""
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        # 为每一层初始化量化器
+
+        # 获取head_dim（从父类或参数）
+        head_dim = getattr(self, 'head_dim', kwargs.get('kv_headdim', 128))
+        num_layers = getattr(self, 'num_layers', kwargs.get('num_layers', 32))
+
+        # 为每一层初始化2-bit量化器
         self.quantizers = [
             RandomRotationLVQ4BitQuantizer(
-                num_prototypes=16,  # 4-bit
-                rotation_dim=min(64, self.head_dim),
+                num_prototypes=4,  # 2-bit: 4个原型
+                rotation_dim=min(64, head_dim),
                 seed=42 + i
             )
-            for i in range(self.num_layers)
+            for i in range(num_layers)
         ]
-        
-        # 存储量化后的数据（CPU内存）
-        self.quantized_host_storage = {}
-    
-    def offload_kvcache_launch(self, kvcache_metadata):
-        """修改：在offload时进行量化"""
+
+        self.offload_worker = ThreadPoolExecutor(max_workers=4)
+
+    def offload_kvcache_quant(self, kvcache_metadata):
+
+        print("debug in quant_xx.py: function offload_kvcache_launch")
+        """修改：在offload时进行2-bit量化"""
         num_offload_pages = len(kvcache_metadata.offload_page_ids)
         if num_offload_pages == 0:
             return None
-        
-        # 分配GPU缓冲区（原始大小）
-        kvcache_metadata.gather_kv_gpu_buffer = torch.empty(
-            [self.num_layers * num_offload_pages, 2, self.page_size, self.num_heads, self.head_dim],
-            dtype=torch.bfloat16, device=torch.cuda.current_device(),
-        )
-        
-        # 调用原始offload（将数据收集到GPU缓冲区）
-        paged_kvcache_ops.offload_kvcache_launch(
-            self.host_kv_mgr,
+
+        if not hasattr(kvcache_metadata, 'gather_kv_gpu_buffer'):
+            # 分配GPU缓冲区（原始大小）
+            kvcache_metadata.gather_kv_gpu_buffer = torch.empty(
+                [self.num_layers * num_offload_pages, 2, self.page_size, self.num_heads, self.head_dim],
+                dtype=torch.bfloat16, device=torch.cuda.current_device(),
+            )
+
+        self.gpu_kvcache_mgr.offload_kvcache(
             kvcache_metadata.kv_offload_handle,
             kvcache_metadata.offload_user_ids,
             kvcache_metadata.offload_page_ids,
@@ -301,112 +309,157 @@ class QuantizedAsyncHSTUKVCacheManager(AsyncHSTUKVCacheManager):
             kvcache_metadata.new_offload_startpos,
             kvcache_metadata.new_offload_lengths,
         )
-        
-        # 异步量化并传输到CPU
+
+       # 异步量化并传输到CPU
         def async_quantize_and_store():
-            quantized_data_all_layers = {}
-            
             for layer_idx in range(self.num_layers):
                 # 提取该层的KV Cache
                 layer_kv = kvcache_metadata.gather_kv_gpu_buffer[
                     layer_idx * num_offload_pages:(layer_idx + 1) * num_offload_pages
                 ]
-                
-                # 使用该层的量化器进行量化
+
+                # 使用该层的量化器进行2-bit量化
                 quantizer = self.quantizers[layer_idx]
                 quantized_data, quant_metadata = quantizer.quantize_kv_cache(
                     layer_kv, layer_idx
                 )
-                
-                # 存储量化后的数据（索引是4-bit，远小于原始数据）
-                quantized_data_all_layers[layer_idx] = {
-                    'data': quantized_data,
-                    'metadata': quant_metadata
-                }
-            
-            # 将量化后的数据移动到CPU（体积大大减小）
-            for layer_idx, data_dict in quantized_data_all_layers.items():
-                # 转换为CPU张量
+
                 cpu_data = {
-                    'key_indices': data_dict['data']['key_indices'].cpu(),
-                    'value_indices': data_dict['data']['value_indices'].cpu()
+                    'key_indices': quantized_data['key_indices'].cpu(),
+                    'value_indices': quantized_data['value_indices'].cpu()
                 }
-                cpu_metadata = data_dict['metadata']
-                
-                # 存储到主机存储
+
                 self.host_kv_mgr.store_quantized_pages(
                     kvcache_metadata.offload_user_ids,
                     kvcache_metadata.offload_page_ids,
                     layer_idx,
                     cpu_data,
-                    cpu_metadata
+                    quant_metadata
                 )
-            
+
             # 释放GPU缓冲区
-            del kvcache_metadata.gather_kv_gpu_buffer
-            torch.cuda.empty_cache()
-        
-        # 在单独的线程中执行量化（避免阻塞）
+            if hasattr(kvcache_metadata, 'gather_kv_gpu_buffer'):
+                del kvcache_metadata.gather_kvcache_gpu_buffer
+                torch.cuda.empty_cache()
+
+        # 在单独的线程中执行量化
         self.offload_worker.submit(async_quantize_and_store)
-    
-    def onload_kvcache_finalize(self, user_ids):
-        """修改：在onload时进行反量化"""
-        # 从主机存储获取量化数据
-        quantized_data_dict = self.host_kv_mgr.retrieve_quantized_pages(user_ids)
-        
-        if quantized_data_dict:
-            # 为每个层异步反量化
-            def async_dequantize(layer_idx, quantized_data, quant_metadata):
+
+
+    def prepare_kvcache_async_quant(self,
+        batch_size,
+        user_ids,
+        total_history_lengths,
+        static_page_ids_gpu_buffer,
+        static_offload_page_ids_gpu_buffer,
+        static_onload_handle,
+    ):
+        origin_cached_lengths = self.gpu_kvcache_mgr.get_total_cache_length(user_ids)
+        new_tokens = sum([ total_history_lengths[idx] - origin_cached_lengths[idx] for idx in range(batch_size) ])
+        if new_tokens <= 0:
+            print(total_history_lengths)
+            print(origin_cached_lengths)
+
+        offload_uids_buffer = torch.empty([batch_size,], dtype=torch.int64)
+        metadata_host_buffer = torch.empty([batch_size * 7 + 7,], dtype=torch.int, pin_memory=True)
+        metadata_gpu_buffer = torch.empty([batch_size * 5 + 4 + new_tokens * 2,], dtype=torch.int, device = torch.cuda.current_device())
+
+        kvcache_metadata_fut = self.executor.submit(paged_kvcache_ops.prepare_kvcache,
+            self.gpu_kvcache_mgr, self.host_kv_mgr,
+            user_ids, total_history_lengths,
+            static_page_ids_gpu_buffer, static_offload_page_ids_gpu_buffer,
+            offload_uids_buffer,
+            metadata_host_buffer, metadata_gpu_buffer)
+
+        static_onload_handle.reset()
+
+        # 修改：创建包含反量化的onload函数
+        def onload_with_dequantization(user_ids, static_onload_handle):
+            """执行onload并包含KV Cache反量化"""
+            # 1. 先执行原始的onload操作
+            self.gpu_kvcache_mgr.onload_kvcache(user_ids, static_onload_handle)
+
+            # 2. 对每个用户进行反量化处理
+            print("debug in quant_xx.py: function onload_kvcache_finalize")
+
+            # 为每个层反量化
+            for layer_idx in range(len(self.quantizers)):
                 quantizer = self.quantizers[layer_idx]
-                
-                # 将数据移回GPU（如果还在CPU）
-                if quantized_data['key_indices'].device.type == 'cpu':
-                    quantized_data['key_indices'] = quantized_data['key_indices'].cuda()
-                    quantized_data['value_indices'] = quantized_data['value_indices'].cuda()
-                
-                # 反量化
-                dequantized_kv = quantizer.dequantize_kv_cache(quantized_data, quant_metadata)
-                return dequantized_kv
-            
-            # 收集所有反量化任务
-            dequantize_futures = []
-            for layer_idx, (quantized_data, quant_metadata) in quantized_data_dict.items():
-                future = self.onload_worker.submit(
-                    async_dequantize, layer_idx, quantized_data, quant_metadata
+
+            # 对每个用户ID处理
+            for user_id in user_ids:
+                # 获取该用户在该层的所有页面ID
+                page_ids = self.host_kv_mgr.get_page_ids_for_user(user_id, layer_idx)
+
+                if not page_ids:
+                    continue
+
+                # 从主机存储获取量化数据
+                retrieved_data = self.host_kv_mgr.retrieve_quantized_pages(
+                    user_id, page_ids, layer_idx
                 )
-                dequantize_futures.append((layer_idx, future))
-            
-            # 等待所有层完成并更新GPU缓存
-            for layer_idx, future in dequantize_futures:
-                dequantized_kv = future.result()
-                
-                # 将反量化后的数据放回GPU缓存表
-                # 这里需要根据实际的页ID更新缓存表
-                page_ids = self.host_kv_mgr.get_page_ids_for_user(user_ids, layer_idx)
-                self.cache_table[layer_idx, page_ids] = dequantized_kv
-        
-        # 调用原始方法完成onload
-        paged_kvcache_ops.onload_kvcache_finalize(self.gpu_kvcache_mgr, self.host_kv_mgr, user_ids)
 
+                if retrieved_data:
+                    # 提取数据指针
+                    key_indices_ptr = retrieved_data['key_indices']
+                    value_indices_ptr = retrieved_data['value_indices']
+                    scales_ptr = retrieved_data['scales']
+                    zeros_ptr = retrieved_data['zeros']
+                    num_pages = retrieved_data['num_pages']
 
-# ============ 使用示例 ============
-if __name__ == "__main__":
-    # 初始化量化版缓存管理器
-    quantized_manager = QuantizedAsyncHSTUKVCacheManager(
-        num_layers=32,
-        num_kv_heads=32,
-        kv_headdim=128,
-        num_tokens_per_page=128,
-        num_primary_cache_pages=8192,
-        num_onload_buffer_pages=1024,
-        num_reserved_buffer_pages=512,
-        num_tokens_per_chunk=256,
-        max_num_sequences=256,
-        max_sequence_length=8192,
-        max_batch_size=64,
-    )
-    
-    print("4-bit量化KV Cache管理器初始化完成")
-    print(f"原始KV Cache大小: {quantized_manager.cache_table.nelement() * 2 / 1e9:.2f} GB")
-    print(f"量化后预期大小: {quantized_manager.cache_table.nelement() * 0.25 / 1e9:.2f} GB")
-    print("压缩率: 75% 内存节省")
+                    # 将数据转换为PyTorch张量
+                    quant_page_numel = self.host_kv_mgr.quant_page_numel
+                    num_kv_heads = self.host_kv_mgr.num_kv_heads
+
+                    # 创建量化数据字典
+                    quantized_data = {
+                        'key_indices': torch.from_numpy(
+                            np.ctypeslib.as_array(
+                                ctypes.cast(key_indices_ptr, ctypes.POINTER(ctypes.c_uint16)),
+                                shape=(num_pages, quant_page_numel)
+                            )
+                        ).cuda(),
+                        'value_indices': torch.from_numpy(
+                            np.ctypeslib.as_array(
+                                ctypes.cast(value_indices_ptr, ctypes.POINTER(ctypes.c_uint16)),
+                                shape=(num_pages, quant_page_numel)
+                            )
+                        ).cuda()
+                    }
+
+                    # 创建量化元数据
+                    quant_metadata = {
+                        'scales': torch.from_numpy(
+                            np.ctypeslib.as_array(
+                                ctypes.cast(scales_ptr, ctypes.POINTER(ctypes.c_float)),
+                                shape=(num_pages, num_kv_heads)
+                            )
+                        ).cuda(),
+                        'zeros': torch.from_numpy(
+                            np.ctypeslib.as_array(
+                                ctypes.cast(zeros_ptr, ctypes.POINTER(ctypes.c_float)),
+                                shape=(num_pages, num_kv_heads)
+                            )
+                        ).cuda(),
+                        'bits': 2,  # 假设是2-bit量化
+                        'group_size': 4  # 假设分组大小为4
+                    }
+
+                    # 反量化
+                    dequantized_kv = quantizer.dequantize_kv_cache(quantized_data, quant_metadata)
+
+                    # 将反量化后的数据放回GPU缓存表
+                    # 这里需要根据实际的页ID更新缓存表
+                    # 假设cache_table的格式是: cache_table[layer_idx][user_id][page_id]
+                    for i, page_id in enumerate(page_ids):
+                        if page_id < len(self.cache_table[layer_idx][user_id]):
+                            self.cache_table[layer_idx][user_id][page_id] = dequantized_kv[i]
+
+                    # 释放检索到的数据内存
+                    self.host_kv_mgr.free_retrieved_pages(retrieved_data)
+
+                     # 修改：提交包含反量化的onload任务
+        onload_fut = self.onload_worker.submit(onload_with_dequantization,
+            user_ids, static_onload_handle)
+
+        return origin_cached_lengths, new_tokens, offload_uids_buffer, metadata_host_buffer, metadata_gpu_buffer, kvcache_metadata_fut, onload_fut

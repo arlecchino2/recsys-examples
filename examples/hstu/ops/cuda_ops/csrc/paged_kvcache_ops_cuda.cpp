@@ -290,6 +290,22 @@ namespace kvcache {
 class HostKVStorageImpl
 {
 public:
+    struct QuantizedPage {
+        uint16_t* key_indices;      // 量化后的键索引
+        uint16_t* value_indices;    // 量化后的值索引
+        float* scales;              // 量化缩放因子
+        float* zeros;               // 量化零点
+        int64_t page_id;            // 页面ID
+        size_t num_indices;         // 索引数量
+    };
+
+    struct QuantMetadata {
+        float scale;                // 量化缩放因子
+        float zero_point;          // 量化零点
+        int bits;                  // 量化位数(如2-bit)
+        int group_size;            // 分组量化大小
+    };
+public:
     HostKVStorageImpl(
         int num_layers,
         int num_kv_heads,
@@ -303,6 +319,8 @@ public:
         , page_size(num_tokens_per_page)
         , chunk_size(num_tokens_per_chunk)
         , _uid_to_chunk_id(num_layers, std::unordered_map<int64_t, std::vector<uintptr_t>>())
+        , quant_page_numel(2 * num_tokens_per_page * num_kv_heads * kv_headdim)
+        , _uid_to_quantized_pages(num_layers, std::unordered_map<int64_t, std::vector<QuantizedPage>>())
     {
         this->chunk_numel = num_tokens_per_chunk * 2 * num_kv_heads * kv_headdim;
         this->page_numel = 2 * page_size * num_kv_heads * kv_headdim;
@@ -310,7 +328,18 @@ public:
     };
 
     ~HostKVStorageImpl()
-    {}
+    {
+        for (auto& layer_map : _uid_to_quantized_pages) {
+            for (auto& user_pages : layer_map) {
+                for (auto& page : user_pages.second) {
+                    if (page.key_indices) delete[] page.key_indices;
+                    if (page.value_indices) delete[] page.value_indices;
+                    if (page.scales) delete[] page.scales;
+                    if (page.zeros) delete[] page.zeros;
+                }
+            }
+        }
+    }
 
     int64_t get_kvdata_length(int64_t user_id) {
         auto it = _uid_to_length.find(user_id);
@@ -330,9 +359,9 @@ public:
             _uid_to_mempool[user_id] = std::vector<uintptr_t>();
         }
 
-            size_t num_chunks = length / chunk_size;
-            size_t num_elem = length * per_token_numel;
-            size_t kvdata_size = num_elem * sizeof(uint16_t);
+        size_t num_chunks = length / chunk_size;
+        size_t num_elem = length * per_token_numel;
+        size_t kvdata_size = num_elem * sizeof(uint16_t);
 
         for (int layer_idx = 0; layer_idx < num_layers; layer_idx++) {
             uint16_t* src_ptr = pinned_input_ptr + layer_idx * gather_layer_stride;
@@ -381,6 +410,216 @@ public:
         return result;
     };
 
+
+    std::vector<QuantizedPage> get_quantized_pages(int64_t user_id, int64_t start_page, int64_t num_pages, int layer_idx) {
+        std::vector<QuantizedPage> result;
+        if (_uid_to_quantized_pages[layer_idx].find(user_id) == _uid_to_quantized_pages[layer_idx].end()) {
+            return result;
+        }
+        const auto& pages = _uid_to_quantized_pages[layer_idx][user_id];
+        for (const auto& page : pages) {
+            if (page.page_id >= start_page && page.page_id < start_page + num_pages) {
+                result.push_back(page);
+            }
+        }
+        return result;
+    };
+
+
+    void free_retrieved_pages(std::unordered_map<std::string, void*>& retrieved_data) {
+        if (retrieved_data.find("key_indices") != retrieved_data.end()) {
+            delete[] static_cast<uint16_t*>(retrieved_data["key_indices"]);
+        }
+        if (retrieved_data.find("value_indices") != retrieved_data.end()) {
+            delete[] static_cast<uint16_t*>(retrieved_data["value_indices"]);
+        }
+        if (retrieved_data.find("scales") != retrieved_data.end()) {
+            delete[] static_cast<float*>(retrieved_data["scales"]);
+        }
+        if (retrieved_data.find("zeros") != retrieved_data.end()) {
+            delete[] static_cast<float*>(retrieved_data["zeros"]);
+        }
+        retrieved_data.clear();
+    };
+
+
+    std::unordered_map<std::string, void*> retrieve_quantized_pages(
+        int64_t user_id,
+        const std::vector<int64_t>& page_ids,
+        int layer_idx
+    ) {
+        std::unordered_map<std::string, void*> result;
+
+        // 初始化返回的数据结构
+        size_t num_pages = page_ids.size();
+        size_t total_indices = num_pages * quant_page_numel;
+        size_t total_scales = num_pages * num_kv_heads;
+
+        uint16_t* key_indices = new uint16_t[total_indices];
+        uint16_t* value_indices = new uint16_t[total_indices];
+        float* scales = new float[total_scales];
+        float* zeros = new float[total_scales];
+
+        if (_uid_to_quantized_pages[layer_idx].find(user_id) !=
+            _uid_to_quantized_pages[layer_idx].end()) {
+
+            const auto& pages = _uid_to_quantized_pages[layer_idx][user_id];
+            std::unordered_map<int64_t, const QuantizedPage*> page_map;
+
+            // 构建页面ID到页面的映射
+            for (const auto& page : pages) {
+                page_map[page.page_id] = &page;
+            }
+
+            for (size_t i = 0; i < page_ids.size(); ++i) {
+                int64_t page_id = page_ids[i];
+                auto it = page_map.find(page_id);
+
+                if (it != page_map.end()) {
+                    const QuantizedPage* page = it->second;
+                    // 复制键索引
+                    std::memcpy(
+                        key_indices + i * quant_page_numel,
+                        page->key_indices, quant_page_numel * sizeof(uint16_t));
+
+                    // 复制值索引
+                    std::memcpy(
+                        value_indices + i * quant_page_numel,
+                        page->value_indices,
+                        quant_page_numel * sizeof(uint16_t)
+                    );
+
+                    // 复制缩放因子和零点
+                    std::memcpy(
+                        scales + i * num_kv_heads,
+                        page->scales,
+                        num_kv_heads * sizeof(float)
+                    );
+
+                    std::memcpy(
+                        zeros + i * num_kv_heads,
+                        page->zeros,
+                        num_kv_heads * sizeof(float)
+                    );
+                } else {
+                    std::memset(
+                        key_indices + i * quant_page_numel,
+                        0,
+                        quant_page_numel * sizeof(uint16_t)
+                    );
+
+                    std::memset(
+                        value_indices + i * quant_page_numel,
+                        0,
+                        quant_page_numel * sizeof(uint16_t)
+                    );
+
+                    std::memset(
+                        scales + i * num_kv_heads,
+                        0,
+                        num_kv_heads * sizeof(float)
+                    );
+
+                    std::memset(
+                        zeros + i * num_kv_heads,
+                        0,
+                        num_kv_heads * sizeof(float)
+                    );
+                }
+            }
+        } else {
+            // 用户不存在，填充零值
+            std::memset(key_indices, 0, total_indices * sizeof(uint16_t));
+            std::memset(value_indices, 0, total_indices * sizeof(uint16_t));
+            std::memset(scales, 0, total_scales * sizeof(float));
+            std::memset(zeros, 0, total_scales * sizeof(float));
+        }
+
+        result["key_indices"] = key_indices;
+        result["value_indices"] = value_indices;
+        result["scales"] = scales;
+        result["zeros"] = zeros;
+        result["num_pages"] = reinterpret_cast<void*>(num_pages);
+        result["page_size"] = reinterpret_cast<void*>(page_size);
+        result["num_kv_heads"] = reinterpret_cast<void*>(num_kv_heads);
+        result["kv_headdim"] = reinterpret_cast<void*>(kv_headdim);
+        
+        return result;
+    };
+
+
+    std::vector<int64_t> get_page_ids_for_user(int64_t user_id, int layer_idx) {
+        std::vector<int64_t> page_ids;
+        if (_uid_to_quantized_pages[layer_idx].find(user_id) ==
+            _uid_to_quantized_pages[layer_idx].end()) {
+            return page_ids;
+        }
+        const auto& pages = _uid_to_quantized_pages[layer_idx][user_id];
+        page_ids.reserve(pages.size());
+
+        for (const auto& page : pages) {
+            page_ids.push_back(page.page_id);
+        }
+
+        return page_ids;
+    };
+
+
+    void store_quantized_pages(
+        const std::vector<int64_t>& user_ids,
+        const std::vector<int64_t>& page_ids,
+        int layer_idx,
+        const std::unordered_map<std::string, uint16_t*>& cpu_data,
+        const std::unordered_map<std::string, float*>& quant_metadata
+    ) {
+        assert(user_ids.size() == page_ids.size());
+        assert(cpu_data.find("key_indices") != cpu_data.end());
+        assert(cpu_data.find("value_indices") != cpu_data.end());
+        assert(quant_metadata.find("scales") != quant_metadata.end());
+        assert(quant_metadata.find("zeros") != quant_metadata.end());
+
+        uint16_t* key_indices = cpu_data.at("key_indices");
+        uint16_t* value_indices = cpu_data.at("value_indices");
+        float* scales = quant_metadata.at("scales");
+        float* zeros = quant_metadata.at("zeros");
+
+        for (size_t i = 0; i < user_ids.size(); ++i) {
+            int64_t user_id = user_ids[i];
+            int64_t page_id = page_ids[i];
+
+            if (_uid_to_quantized_pages[layer_idx].find(user_id) == _uid_to_quantized_pages[layer_idx].end()) {
+                _uid_to_quantized_pages[layer_idx][user_id] = std::vector<QuantizedPage>();
+            }
+
+            size_t page_offset = i * quant_page_numel;
+            size_t scale_offset = i * num_kv_heads; // 假设每个头有自己的缩放因子
+
+            // 复制量化数据到新分配的内存
+            uint16_t* key_copy = new uint16_t[quant_page_numel];
+            uint16_t* value_copy = new uint16_t[quant_page_numel];
+            float* scales_copy = new float[num_kv_heads];
+            float* zeros_copy = new float[num_kv_heads];
+
+            std::memcpy(key_copy, key_indices + page_offset, quant_page_numel * sizeof(uint16_t));
+            std::memcpy(value_copy, value_indices + page_offset, quant_page_numel * sizeof(uint16_t));
+            std::memcpy(scales_copy, scales + scale_offset, num_kv_heads * sizeof(float));
+            std::memcpy(zeros_copy, zeros + scale_offset, num_kv_heads * sizeof(float));
+
+            QuantizedPage page;
+            page.key_indices = key_copy;
+            page.value_indices = value_copy;
+            page.scales = scales_copy;
+            page.zeros = zeros_copy;
+            page.page_id = page_id;
+            page.num_indices = quant_page_numel;
+
+            _uid_to_quantized_pages[layer_idx][user_id].push_back(page);
+
+            _uid_to_length[user_id] = page_id * page_size + page_size;
+
+            }
+    };
+
     public:
         std::vector<std::unordered_map<int64_t, std::vector<uintptr_t>>> _uid_to_chunk_id;
         std::unordered_map<int64_t, int64_t> _uid_to_length;
@@ -396,6 +635,9 @@ public:
         size_t page_numel;
         size_t per_token_numel;
         size_t layer_numel;
+
+        size_t quant_page_numel;
+        std::vector<std::unordered_map<int64_t, std::vector<QuantizedPage>>> _uid_to_quantized_pages;
 };
 
 // class PinnedDoubleBuffer {
@@ -608,6 +850,7 @@ public:
                 }
             }
             if (num_offloading_uids == 0) assert(false);
+            std::cout << "[Debug] getUIdToEvict end" << std::endl;
             
             std::this_thread::yield();
         }
@@ -1578,11 +1821,13 @@ void prepare_kvcache(
     //     //             << std::endl;
     //     // }
     // };
+
     void sync_onload_buffer_to_cache(
         GPUKVCacheMangerImpl& gpu_mgr,
         std::vector<int64_t>& user_ids
     )
     {
+        std::cout << "sync_onload_buffer_to_cache start" << std::endl << std::flush;
         int batch_size = user_ids.size();
         std::unordered_set<int64_t> freezed_uids(user_ids.begin(), user_ids.end());
         std::vector<size_t> onload_lengths(batch_size);
@@ -1633,8 +1878,126 @@ void prepare_kvcache(
                 }
             }
         }
+        std::cout <<"sync_onload_buffer_to_cache end" << std::endl;
         // cudaStreamSynchronize(gpu_mgr.sync_stream);
     };
+
+    void sync_onload_buffer_to_cache_v2(
+        GPUKVCacheMangerImpl& gpu_mgr,
+        std::vector<int64_t>& user_ids
+    )
+    {
+        std::cout << "sync_onload_buffer_v2_to_cache start" << std::endl << std::flush;
+        int batch_size = user_ids.size();
+        std::unordered_set<int64_t> freezed_uids(user_ids.begin(), user_ids.end());
+        std::vector<size_t> onload_lengths(batch_size);
+        std::vector<size_t> onload_offsets(batch_size + 1, 0);
+
+        // 计算每个用户的onload长度
+        for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+            int64_t uid = user_ids[seq_idx];
+            if (gpu_mgr._uid_to_paged_cache_startpos.find(uid) != gpu_mgr._uid_to_paged_cache_startpos.end())
+                onload_lengths[seq_idx] = gpu_mgr._uid_to_paged_cache_startpos[uid];
+            else if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
+                onload_lengths[seq_idx] = gpu_mgr._uid_to_offloaded_length[uid];
+            else
+                onload_lengths[seq_idx] = 0;
+            onload_offsets[seq_idx + 1] = onload_offsets[seq_idx] + onload_lengths[seq_idx];
+        }
+        size_t total_onload_length = onload_offsets[batch_size];
+        if (total_onload_length == 0) return;
+
+        // 分配页面（只在第0层分配，所有层共享）
+        for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+            int64_t uid = user_ids[seq_idx];
+            size_t len = onload_lengths[seq_idx];
+            if (len == 0) continue;
+            
+            int num_pages = len / gpu_mgr.num_tokens_per_page;
+            
+            std::vector<int32_t> new_page_ids;
+            while ((size_t)num_pages > gpu_mgr._empty_pages.size()) {
+                std::cout << "[DEBUG] evict start" << std::endl;
+                int64_t uid_to_evict = gpu_mgr.getUIdToEvict(freezed_uids);
+                gpu_mgr.evict(uid_to_evict);
+            }
+            for (int i = 0; i < num_pages; ++i) {
+                new_page_ids.push_back(gpu_mgr._empty_pages.front());
+                gpu_mgr._empty_pages.pop();
+            }
+
+            gpu_mgr._uid_to_page_id[uid].insert(gpu_mgr._uid_to_page_id[uid].begin(), new_page_ids.begin(), new_page_ids.end());
+            gpu_mgr._uid_to_paged_cache_startpos[uid] = 0;
+            gpu_mgr._uid_to_paged_cache_length[uid] += len;
+        }
+
+        std::vector<int32_t> global_target_pages;
+        
+        for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
+            int64_t uid = user_ids[seq_idx];
+            size_t len = onload_lengths[seq_idx];
+            if (len == 0) continue;
+            
+            int num_pages = len / gpu_mgr.num_tokens_per_page;
+            const auto& user_pages = gpu_mgr._uid_to_page_id[uid];
+            
+            for (int page_i = 0; page_i < num_pages; ++page_i) {
+                global_target_pages.push_back(user_pages[page_i]);
+            }
+        }
+        
+        // 目标页面连续性
+        std::vector<std::tuple<int32_t, size_t, size_t>> continuous_segments;
+        size_t src_offset = 0;
+        
+        for (size_t i = 0; i < global_target_pages.size(); ) {
+            int32_t start_page = global_target_pages[i];
+            size_t segment_len = 1;
+            
+            //
+            while (i + segment_len < global_target_pages.size()) {
+                if (global_target_pages[i + segment_len] == global_target_pages[i + segment_len - 1] + 1) {
+                    segment_len++;
+                } else {
+                    break;
+                }
+            }
+            
+            continuous_segments.emplace_back(start_page, src_offset, segment_len);
+            // if (segment_len > 1) {
+            //     std::cout << "[CONTINUOUS_SEGMENT] Pages " << start_page 
+            //             << "-" << (start_page + segment_len - 1)
+            //             << " (" << segment_len << " pages)" << std::endl;
+            // }
+            
+            src_offset += segment_len * gpu_mgr.page_stride;
+            i += segment_len;
+        }
+
+        for (int layer_idx = 0; layer_idx < gpu_mgr.num_layers; ++layer_idx) {
+            uint16_t* gpu_onload_buffer = gpu_mgr.get_cache_table_by_layer(layer_idx) + 
+                                    gpu_mgr.num_primary_cache_pages * gpu_mgr.page_stride;
+            
+            for (const auto& [start_page_id, src_offset, num_pages] : continuous_segments) {
+                uint16_t* src = gpu_onload_buffer + src_offset / sizeof(uint16_t);
+                uint16_t* dst = gpu_mgr.get_cache_table_by_layer(layer_idx) + 
+                            start_page_id * gpu_mgr.page_stride / sizeof(uint16_t);
+                
+                if (num_pages > 1) {
+                    size_t total_bytes = num_pages * gpu_mgr.page_stride * sizeof(uint16_t);
+                    cudaMemcpyAsync(dst, src, total_bytes, cudaMemcpyDeviceToDevice, gpu_mgr.sync_stream);
+                    std::cout << "[BATCH_COPY] Layer " << layer_idx 
+                            << ": " << num_pages << " pages (" << start_page_id 
+                            << "-" << (start_page_id + num_pages - 1) << ")" << std::endl;
+                } else {
+                    cudaMemcpyAsync(dst, src, gpu_mgr.page_stride * sizeof(uint16_t), cudaMemcpyDeviceToDevice, gpu_mgr.sync_stream);
+                }
+            }
+        }
+        
+        std::cout << "sync_onload_buffer_to_cache end" << std::endl << std::flush;
+        // cudaStreamSynchronize(gpu_mgr.sync_stream);
+    }
     
     void synchronize_sync_stream(
         GPUKVCacheMangerImpl& gpu_mgr
@@ -1695,5 +2058,5 @@ PYBIND11_MODULE(paged_kvcache_ops, m) {
 
   m.def("prepare_kvcache", &kvcache::prepare_kvcache, "prepare_kvcache", py::call_guard<py::gil_scoped_release>());
   m.def("synchronize_sync_stream", &kvcache::synchronize_sync_stream, "synchronize sync stream", py::call_guard<py::gil_scoped_release>());
-  m.def("sync_onload_buffer_to_cache", &kvcache::sync_onload_buffer_to_cache, "sync onload buffer to main cache", py::call_guard<py::gil_scoped_release>());
+  m.def("sync_onload_buffer_to_cache", &kvcache::sync_onload_buffer_to_cache_v2, "sync onload buffer to main cache", py::call_guard<py::gil_scoped_release>());
 }

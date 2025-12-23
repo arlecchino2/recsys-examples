@@ -31,7 +31,7 @@ from modules.inference_embedding import InferenceEmbedding
 from modules.jagged_data import JaggedData
 from modules.mlp import MLP
 from ops.triton_ops.triton_jagged import triton_concat_2D_jagged
-from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
+# from modules.async_kvcache_manager import AsyncHSTUKVCacheManager
 from modules.quant_async_kvcache_manager import QuantizedAsyncHSTUKVCacheManager
 import math
 import time
@@ -232,6 +232,7 @@ class InferenceRankingGR(torch.nn.Module):
             return            
         self.logger.info("=" * 60)
         self.logger.info("TIMING SUMMARY")
+        print("TIMING SUMMARY")
         self.logger.info("=" * 60)
         
         for method_name, stats in self.timing_stats.items():
@@ -239,14 +240,19 @@ class InferenceRankingGR(torch.nn.Module):
                 avg_total = stats['total_time'] / stats['count']
                 self.logger.info(f"\n{method_name.upper()}:")
                 self.logger.info(f"  Total calls: {stats['count']}")
+                print(f"  Total calls: {stats['count']}")
                 self.logger.info(f"  Total time: {stats['total_time']:.6f}s")
+                print(f"  Total time: {stats['total_time']:.6f}s")
                 self.logger.info(f"  Average time per call: {avg_total:.6f}s")
+                print(f"  Average time per call: {avg_total:.6f}s")
                 
                 self.logger.info("  Step-wise averages:")
+                print("  Step-wise averages:")
                 for step, step_stats in stats['step_times'].items():
                     avg_step = step_stats['total'] / step_stats['count']
                     percentage = (avg_step / avg_total) * 100
                     self.logger.info(f"    {step}: {avg_step:.6f}s ({percentage:.1f}%)")
+                    print(f"    {step}: {avg_step:.6f}s ({percentage:.1f}%)")
 
     
     def analyze_cache_distribution(
@@ -302,10 +308,10 @@ class InferenceRankingGR(torch.nn.Module):
             self.cache_stats['total_sequence_length'] += batch_total_length
             self.cache_stats['batch_count'] += 1
         
-        # 记录每个batch的缓存分布
-        self.logger.info(f"Host Load: {batch_host_load_length}, "
-                        f"GPU Cache: {batch_gpu_length}, "
-                        f"New Tokens: {batch_new_tokens}")
+        # # 记录每个batch的缓存分布
+        # self.logger.info(f"Host Load: {batch_host_load_length}, "
+        #                 f"GPU Cache: {batch_gpu_length}, "
+        #                 f"New Tokens: {batch_new_tokens}")
 
     def print_cache_summary(self):
         if self.cache_stats['batch_count'] == 0:
@@ -685,6 +691,7 @@ class InferenceRankingGR(torch.nn.Module):
             with nvtx.range("prepare_kvcache_async"):            
                 user_ids_list = user_ids.tolist()
 
+                # prepare_kvcache_result = self.async_kvcache.prepare_kvcache_async_quant(
                 prepare_kvcache_result = self.async_kvcache.prepare_kvcache_async(
                     batch.batch_size,
                     user_ids_list,
@@ -707,6 +714,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.synchronize()
                 timing_info['prepare_kvcache_async'] = time.time() - prepare_kvcache_start
 
+            print("complete prepare kvcache")
             # 2. 去除已缓存的token
             if self.enable_timing_stats:
                 strip_cached_start = time.time()
@@ -740,6 +748,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.synchronize()
                 timing_info['preprocessing'] = time.time() - preprocess_start
 
+            print("complete preprocessing")
             # 5. 等待KV Cache准备完成
             if self.enable_timing_stats:
                 prepare_kvcache_wait_start = time.time()
@@ -760,6 +769,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.synchronize()
                 timing_info['prepare_kvcache_wait'] = time.time() - prepare_kvcache_wait_start
 
+            print("complete prepare_kvcache_wait")
             # print("[DEBUG] kv_indices", kvcache_metadata.kv_indices)
             # print("[DEBUG] kv_indptr", kvcache_metadata.kv_indptr)
             # print("[DEBUG] kv_last_page_len", kvcache_metadata.kv_last_page_len)
@@ -784,7 +794,7 @@ class InferenceRankingGR(torch.nn.Module):
             # print("[DEBUG] new_history_nnz", kvcache_metadata.new_history_nnz)
             # print("[DEBUG] new_history_nnz_cuda", kvcache_metadata.new_history_nnz_cuda)
 
-            # print("kvcache_metadata.offload_user_ids", kvcache_metadata.offload_user_ids)
+            print("kvcache_metadata.offload_user_ids", kvcache_metadata.offload_user_ids)
             # print("kvcache_metadata.offload_page_ids", kvcache_metadata.offload_page_ids.shape)
 
             # 6. 更新KV Cache元数据
@@ -815,11 +825,13 @@ class InferenceRankingGR(torch.nn.Module):
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
                 timing_info['hstu_inference'] = time.time() - hstu_start
+            print("complete hstu inference")
             
             # 8. 下沉KV Cache
             if self.enable_timing_stats:
                 offload_kvcache_start = time.time()
             with nvtx.range("offload_kvcache"):
+                # self.async_kvcache.offload_kvcache_quant(kvcache_metadata)
                 self.async_kvcache.offload_kvcache(kvcache_metadata)
                 # kvcache_metadata.kv_offload_handle.record_ready()
                 # fut = self.async_kvcache.finalize_kvcache(kvcache_metadata)
@@ -835,6 +847,7 @@ class InferenceRankingGR(torch.nn.Module):
                 jagged_item_logit = self._mlp(jagged_data.values)
                 self.async_kvcache.synchronize_sync_stream()
                 
+            print("complete postprocess_and_mlp")
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
                 timing_info['postprocess_and_mlp'] = time.time() - postprocess_start
@@ -909,9 +922,9 @@ class InferenceRankingGR(torch.nn.Module):
                 if self.count > 1000:
                     self._update_timing_stats('forward_no_cache', timing_info)
                     
-                    self.logger.info(f"====== Forward WITHOUT KV Cache (Call #{self.timing_stats['forward_no_cache']['count']}) ======")
-                    for step, duration in timing_info.items():
-                        self.logger.info(f"{step}: {duration:.6f}s")
+                    # self.logger.info(f"====== Forward WITHOUT KV Cache (Call #{self.timing_stats['forward_no_cache']['count']}) ======")
+                    # for step, duration in timing_info.items():
+                    #     self.logger.info(f"{step}: {duration:.6f}s")
 
         return jagged_item_logit
 

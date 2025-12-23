@@ -52,8 +52,8 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_12_22"
-# log_dir = "./logs_without_kv/logs_12_17"
+log_dir = "./logs/logs_12_23"
+# log_dir = "./logs_without_kv/logs_12_23"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -61,7 +61,7 @@ if not os.path.exists(log_dir):
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 logger.propagate = False
-file_handler = logging.FileHandler(log_file, mode='a', encoding=None, delay=False)
+file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8', delay=False)
 file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(message)s')
 file_handler.setFormatter(formatter)
@@ -193,7 +193,7 @@ def get_inference_hstu_model(
         # "blocks_in_primary_pool": 10240,
         "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,
-        "offload_chunksize": 4096, 
+        "offload_chunksize": 512, 
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -246,6 +246,7 @@ def run_ranking_gr_simulate(
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
     )
+    logger.info(f"max_bs: {max_bs}")
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
     num_contextual_features = (
@@ -327,8 +328,12 @@ def run_ranking_gr_simulate(
                     if num_batches_ctr == 1000:
                         start_time = time.time()
                     uids, dates, seq_endptrs = next(dataloader_iter)
+                    # if num_batches_ctr % 500 == 0:
+                    #     logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
+                    #     print(f"{num_batches_ctr}, uids: {uids.tolist()}")
+                        # print(uids, dates, seq_endptrs)
+                    logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}")
                     print(f"{num_batches_ctr}, uids: {uids.tolist()}")
-                    # print(uids, dates, seq_endptrs)
                     if dates[0] != cur_date:
                         # if cur_date is not None:
                             # eval_metric_dict = eval_module.compute()
@@ -369,11 +374,15 @@ def run_ranking_gr_simulate(
 
                     
                     prof.step()
-                    logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
                     
                     # if num_batches_ctr == 1000:
                     # if num_batches_ctr * max_batch_size >= 140000:
                     #     break
+
+                    if num_batches_ctr % 10000 == 0:
+                        # model.print_cache_summary()
+                        # if enable_timing_stats:
+                        model._print_timing_summary()
                 except StopIteration:
                     break
         end_time = time.time()
