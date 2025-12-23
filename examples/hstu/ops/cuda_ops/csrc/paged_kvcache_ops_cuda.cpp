@@ -1068,6 +1068,12 @@ private:
                         host_kv_mgr->append_kvdata_v2(uid, offload_startpos[seq_idx], offload_lengths[seq_idx], input_ptr, gather_layer_stride);
                         this->_uid_to_offloaded_length[uid] = offload_startpos[seq_idx] + offload_lengths[seq_idx];
                         page_offset += offload_lengths[seq_idx] / this->num_tokens_per_page;
+                        {
+                            std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+                            if (offload_startpos[seq_idx] + offload_lengths[seq_idx] == queued_offload_lastpos[uid]) {
+                                queued_offload_lastpos.erase(uid);
+                            }
+                        }
                     }
                 }
 
@@ -1124,6 +1130,8 @@ public:
     std::queue<std::tuple<std::vector<int>, at::Tensor, at::Tensor, cudaEvent_t>> offload_task_queue;
     std::mutex offload_task_mutex_;
     std::condition_variable offload_task_cv_;
+    std::unordered_map<int64_t, int> queued_offload_lastpos;
+    std::mutex queued_offload_lastpos_mutex_;
 
     int num_offload_memcpy_worker;
     std::vector<std::thread> offload_memcpy_worker;
@@ -1224,10 +1232,20 @@ void prepare_kvcache(
         new_history_offsets[seq_idx + 1] = new_history_offsets[seq_idx] + total_history_length - old_history_lengths[seq_idx];
 
         auto offloaded_length = 0;
+        auto chunked_length = total_history_length - total_history_length % gpu_mgr.num_tokens_per_chunk;
         if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
             offloaded_length = gpu_mgr._uid_to_offloaded_length[uid];
+        {
+            std::unique_lock<std::mutex> lock(gpu_mgr.queued_offload_lastpos_mutex_);
+            if (gpu_mgr.queued_offload_lastpos.find(uid) != gpu_mgr.queued_offload_lastpos.end()) {
+                offloaded_length = gpu_mgr.queued_offload_lastpos[uid];
+            }
+            if (total_history_length - offloaded_length >= gpu_mgr.num_tokens_per_chunk) {
+                gpu_mgr.queued_offload_lastpos[uid] = chunked_length;
+            }
+        }
         if (total_history_length - offloaded_length >= gpu_mgr.num_tokens_per_chunk) {
-            auto chunked_length = total_history_length - total_history_length % gpu_mgr.num_tokens_per_chunk;
+            // auto chunked_length = total_history_length - total_history_length % gpu_mgr.num_tokens_per_chunk;
             auto new_offload_page_start = (offloaded_length - gpu_cache_startpos) / gpu_mgr.num_tokens_per_page;
 
             offload_user_ids[num_offload_uids] = uid;
