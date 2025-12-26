@@ -335,22 +335,6 @@ namespace kvcache {
 class HostKVStorageImpl
 {
 public:
-    struct QuantizedPage {
-        uint16_t* key_indices;      // 量化后的键索引
-        uint16_t* value_indices;    // 量化后的值索引
-        float* scales;              // 量化缩放因子
-        float* zeros;               // 量化零点
-        int64_t page_id;            // 页面ID
-        size_t num_indices;         // 索引数量
-    };
-
-    struct QuantMetadata {
-        float scale;                // 量化缩放因子
-        float zero_point;          // 量化零点
-        int bits;                  // 量化位数(如2-bit)
-        int group_size;            // 分组量化大小
-    };
-public:
     HostKVStorageImpl(
         int num_layers,
         int num_kv_heads,
@@ -364,8 +348,6 @@ public:
         , page_size(num_tokens_per_page)
         , chunk_size(num_tokens_per_chunk)
         , _uid_to_chunk_id(num_layers, std::unordered_map<int64_t, std::vector<uintptr_t>>())
-        , quant_page_numel(2 * num_tokens_per_page * num_kv_heads * kv_headdim)
-        , _uid_to_quantized_pages(num_layers, std::unordered_map<int64_t, std::vector<QuantizedPage>>())
     {
         this->chunk_numel = num_tokens_per_chunk * 2 * num_kv_heads * kv_headdim;
         this->page_numel = 2 * page_size * num_kv_heads * kv_headdim;
@@ -373,18 +355,7 @@ public:
     };
 
     ~HostKVStorageImpl()
-    {
-        for (auto& layer_map : _uid_to_quantized_pages) {
-            for (auto& user_pages : layer_map) {
-                for (auto& page : user_pages.second) {
-                    if (page.key_indices) delete[] page.key_indices;
-                    if (page.value_indices) delete[] page.value_indices;
-                    if (page.scales) delete[] page.scales;
-                    if (page.zeros) delete[] page.zeros;
-                }
-            }
-        }
-    }
+    {}
 
     int64_t get_kvdata_length(int64_t user_id) {
         auto it = _uid_to_length.find(user_id);
@@ -455,216 +426,6 @@ public:
         return result;
     };
 
-
-    std::vector<QuantizedPage> get_quantized_pages(int64_t user_id, int64_t start_page, int64_t num_pages, int layer_idx) {
-        std::vector<QuantizedPage> result;
-        if (_uid_to_quantized_pages[layer_idx].find(user_id) == _uid_to_quantized_pages[layer_idx].end()) {
-            return result;
-        }
-        const auto& pages = _uid_to_quantized_pages[layer_idx][user_id];
-        for (const auto& page : pages) {
-            if (page.page_id >= start_page && page.page_id < start_page + num_pages) {
-                result.push_back(page);
-            }
-        }
-        return result;
-    };
-
-
-    void free_retrieved_pages(std::unordered_map<std::string, void*>& retrieved_data) {
-        if (retrieved_data.find("key_indices") != retrieved_data.end()) {
-            delete[] static_cast<uint16_t*>(retrieved_data["key_indices"]);
-        }
-        if (retrieved_data.find("value_indices") != retrieved_data.end()) {
-            delete[] static_cast<uint16_t*>(retrieved_data["value_indices"]);
-        }
-        if (retrieved_data.find("scales") != retrieved_data.end()) {
-            delete[] static_cast<float*>(retrieved_data["scales"]);
-        }
-        if (retrieved_data.find("zeros") != retrieved_data.end()) {
-            delete[] static_cast<float*>(retrieved_data["zeros"]);
-        }
-        retrieved_data.clear();
-    };
-
-
-    std::unordered_map<std::string, void*> retrieve_quantized_pages(
-        int64_t user_id,
-        const std::vector<int64_t>& page_ids,
-        int layer_idx
-    ) {
-        std::unordered_map<std::string, void*> result;
-
-        // 初始化返回的数据结构
-        size_t num_pages = page_ids.size();
-        size_t total_indices = num_pages * quant_page_numel;
-        size_t total_scales = num_pages * num_kv_heads;
-
-        uint16_t* key_indices = new uint16_t[total_indices];
-        uint16_t* value_indices = new uint16_t[total_indices];
-        float* scales = new float[total_scales];
-        float* zeros = new float[total_scales];
-
-        if (_uid_to_quantized_pages[layer_idx].find(user_id) !=
-            _uid_to_quantized_pages[layer_idx].end()) {
-
-            const auto& pages = _uid_to_quantized_pages[layer_idx][user_id];
-            std::unordered_map<int64_t, const QuantizedPage*> page_map;
-
-            // 构建页面ID到页面的映射
-            for (const auto& page : pages) {
-                page_map[page.page_id] = &page;
-            }
-
-            for (size_t i = 0; i < page_ids.size(); ++i) {
-                int64_t page_id = page_ids[i];
-                auto it = page_map.find(page_id);
-
-                if (it != page_map.end()) {
-                    const QuantizedPage* page = it->second;
-                    // 复制键索引
-                    std::memcpy(
-                        key_indices + i * quant_page_numel,
-                        page->key_indices, quant_page_numel * sizeof(uint16_t));
-
-                    // 复制值索引
-                    std::memcpy(
-                        value_indices + i * quant_page_numel,
-                        page->value_indices,
-                        quant_page_numel * sizeof(uint16_t)
-                    );
-
-                    // 复制缩放因子和零点
-                    std::memcpy(
-                        scales + i * num_kv_heads,
-                        page->scales,
-                        num_kv_heads * sizeof(float)
-                    );
-
-                    std::memcpy(
-                        zeros + i * num_kv_heads,
-                        page->zeros,
-                        num_kv_heads * sizeof(float)
-                    );
-                } else {
-                    std::memset(
-                        key_indices + i * quant_page_numel,
-                        0,
-                        quant_page_numel * sizeof(uint16_t)
-                    );
-
-                    std::memset(
-                        value_indices + i * quant_page_numel,
-                        0,
-                        quant_page_numel * sizeof(uint16_t)
-                    );
-
-                    std::memset(
-                        scales + i * num_kv_heads,
-                        0,
-                        num_kv_heads * sizeof(float)
-                    );
-
-                    std::memset(
-                        zeros + i * num_kv_heads,
-                        0,
-                        num_kv_heads * sizeof(float)
-                    );
-                }
-            }
-        } else {
-            // 用户不存在，填充零值
-            std::memset(key_indices, 0, total_indices * sizeof(uint16_t));
-            std::memset(value_indices, 0, total_indices * sizeof(uint16_t));
-            std::memset(scales, 0, total_scales * sizeof(float));
-            std::memset(zeros, 0, total_scales * sizeof(float));
-        }
-
-        result["key_indices"] = key_indices;
-        result["value_indices"] = value_indices;
-        result["scales"] = scales;
-        result["zeros"] = zeros;
-        result["num_pages"] = reinterpret_cast<void*>(num_pages);
-        result["page_size"] = reinterpret_cast<void*>(page_size);
-        result["num_kv_heads"] = reinterpret_cast<void*>(num_kv_heads);
-        result["kv_headdim"] = reinterpret_cast<void*>(kv_headdim);
-        
-        return result;
-    };
-
-
-    std::vector<int64_t> get_page_ids_for_user(int64_t user_id, int layer_idx) {
-        std::vector<int64_t> page_ids;
-        if (_uid_to_quantized_pages[layer_idx].find(user_id) ==
-            _uid_to_quantized_pages[layer_idx].end()) {
-            return page_ids;
-        }
-        const auto& pages = _uid_to_quantized_pages[layer_idx][user_id];
-        page_ids.reserve(pages.size());
-
-        for (const auto& page : pages) {
-            page_ids.push_back(page.page_id);
-        }
-
-        return page_ids;
-    };
-
-
-    void store_quantized_pages(
-        const std::vector<int64_t>& user_ids,
-        const std::vector<int64_t>& page_ids,
-        int layer_idx,
-        const std::unordered_map<std::string, uint16_t*>& cpu_data,
-        const std::unordered_map<std::string, float*>& quant_metadata
-    ) {
-        assert(user_ids.size() == page_ids.size());
-        assert(cpu_data.find("key_indices") != cpu_data.end());
-        assert(cpu_data.find("value_indices") != cpu_data.end());
-        assert(quant_metadata.find("scales") != quant_metadata.end());
-        assert(quant_metadata.find("zeros") != quant_metadata.end());
-
-        uint16_t* key_indices = cpu_data.at("key_indices");
-        uint16_t* value_indices = cpu_data.at("value_indices");
-        float* scales = quant_metadata.at("scales");
-        float* zeros = quant_metadata.at("zeros");
-
-        for (size_t i = 0; i < user_ids.size(); ++i) {
-            int64_t user_id = user_ids[i];
-            int64_t page_id = page_ids[i];
-
-            if (_uid_to_quantized_pages[layer_idx].find(user_id) == _uid_to_quantized_pages[layer_idx].end()) {
-                _uid_to_quantized_pages[layer_idx][user_id] = std::vector<QuantizedPage>();
-            }
-
-            size_t page_offset = i * quant_page_numel;
-            size_t scale_offset = i * num_kv_heads; // 假设每个头有自己的缩放因子
-
-            // 复制量化数据到新分配的内存
-            uint16_t* key_copy = new uint16_t[quant_page_numel];
-            uint16_t* value_copy = new uint16_t[quant_page_numel];
-            float* scales_copy = new float[num_kv_heads];
-            float* zeros_copy = new float[num_kv_heads];
-
-            std::memcpy(key_copy, key_indices + page_offset, quant_page_numel * sizeof(uint16_t));
-            std::memcpy(value_copy, value_indices + page_offset, quant_page_numel * sizeof(uint16_t));
-            std::memcpy(scales_copy, scales + scale_offset, num_kv_heads * sizeof(float));
-            std::memcpy(zeros_copy, zeros + scale_offset, num_kv_heads * sizeof(float));
-
-            QuantizedPage page;
-            page.key_indices = key_copy;
-            page.value_indices = value_copy;
-            page.scales = scales_copy;
-            page.zeros = zeros_copy;
-            page.page_id = page_id;
-            page.num_indices = quant_page_numel;
-
-            _uid_to_quantized_pages[layer_idx][user_id].push_back(page);
-
-            _uid_to_length[user_id] = page_id * page_size + page_size;
-
-            }
-    };
-
     public:
         std::vector<std::unordered_map<int64_t, std::vector<uintptr_t>>> _uid_to_chunk_id;
         std::unordered_map<int64_t, int64_t> _uid_to_length;
@@ -680,9 +441,6 @@ public:
         size_t page_numel;
         size_t per_token_numel;
         size_t layer_numel;
-
-        size_t quant_page_numel;
-        std::vector<std::unordered_map<int64_t, std::vector<QuantizedPage>>> _uid_to_quantized_pages;
 };
 
 // class PinnedDoubleBuffer {
