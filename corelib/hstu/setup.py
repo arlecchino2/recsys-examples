@@ -34,8 +34,24 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
+root_path: Path = Path(__file__).resolve().parent
+
+cmd = ["git", "rev-parse", "HEAD"]
+sha = subprocess.check_output(cmd, cwd=str(root_path)).decode("ascii").strip()
 
 PACKAGE_NAME = "hstu_attn"
+
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "pip",
+        "uninstall",
+        "-y",
+        PACKAGE_NAME,
+        "--break-system-packages",
+    ]
+)
 
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
@@ -195,23 +211,31 @@ template void run_hstu_fwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
 
 #include "hstu_bwd.h"
 
-template void run_hstu_bwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
+template void run_hstu_bwd_<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>
                            (Hstu_bwd_params& params, cudaStream_t stream);
 
     """
     if not DISABLE_BACKWARD:
-        for hdim, dtype, rab_drab, mask, bwd_deterministic in itertools.product(
-            HEAD_DIMENSIONS, DTYPE_BWD_SM80, RAB_DRAB, MASK, BWD_DETERMINISTIC
+        for (
+            hdim,
+            dtype,
+            rab_drab,
+            mask,
+            bwd_deterministic,
+            arch_sm,
+        ) in itertools.product(
+            HEAD_DIMENSIONS, DTYPE_BWD_SM80, RAB_DRAB, MASK, BWD_DETERMINISTIC, ARCH_SM
         ):
             file_name = (
-                f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_fn{ARBITRARY_NFUNC}_{bwd_deterministic}_sm80.cu"
+                f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_fn{ARBITRARY_NFUNC}_{bwd_deterministic}_sm{arch_sm}.cu"
                 if "arbitrary" in mask
-                else f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_{bwd_deterministic}_sm80.cu"
+                else f"csrc/hstu_attn/src/generated/flash_bwd_hdim{hdim}_{dtype}{rab_drab}{mask}_{bwd_deterministic}_sm{arch_sm}.cu"
             )
             if not os.path.exists(file_name):
                 with open(file_name, "w") as f:
                     f.write(
                         bwd_file_head.format(
+                            arch_sm,
                             dtype_to_str[dtype],
                             hdim,
                             "true" if "_rab" in rab_drab else "false",
@@ -357,7 +381,7 @@ class NinjaBuildExtension(BuildExtension):
 
 setup(
     name=PACKAGE_NAME,
-    version="0.1.0" + "+cu" + str(get_cuda_bare_metal_version(CUDA_HOME)[1]),
+    version="0.1.0" + "+" + sha[:7] + ".cu" + str(bare_metal_version),
     packages=find_packages(
         exclude=(
             "build",

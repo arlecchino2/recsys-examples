@@ -93,6 +93,7 @@ def DynamicEmbDump(
     model: nn.Module,
     table_names: Optional[Dict[str, List[str]]] = None,
     optim: Optional[bool] = False,
+    counter: Optional[bool] = False,
     pg: dist.ProcessGroup = dist.group.WORLD,
     allow_overwrite: bool = False,
 ) -> None:
@@ -115,6 +116,8 @@ def DynamicEmbDump(
         and the value is a list of dynamic embedding table names within that collection. Defaults to None.
     optim : Optional[bool], optional
         Whether to dump the optimizer states. Defaults to False.
+    counter : Optional[bool], optional
+        Whether to dump the embedding admission counter table. Defaults to False.
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the dump. Defaults to None.
 
@@ -157,20 +160,17 @@ def DynamicEmbDump(
         )
         return
 
-    for _, current_collection in enumerate(collections_list):
-        (
-            collection_path,
-            _,
-            current_collection_module,
-        ) = current_collection
+    for collection_path, _, _ in collections_list:
+        full_collection_path = os.path.join(path, collection_path)
+        if not os.path.exists(full_collection_path):
+            os.makedirs(full_collection_path, exist_ok=True)
+    dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
+
+    for collection_path, _, current_collection_module in collections_list:
         full_collection_path = os.path.join(path, collection_path)
         current_dynamic_emb_module_list = get_dynamic_emb_module(
             current_collection_module
         )
-
-        if not os.path.exists(full_collection_path):
-            os.makedirs(full_collection_path, exist_ok=True)
-
         table_names_to_dump = (
             table_names.get(collection_path, None) if table_names else None
         )
@@ -178,6 +178,7 @@ def DynamicEmbDump(
             dynamic_emb_module.dump(
                 full_collection_path,
                 optim=optim,
+                counter=counter,
                 table_names=table_names_to_dump,
                 pg=pg,
             )
@@ -200,6 +201,7 @@ def DynamicEmbLoad(
     model: nn.Module,
     table_names: Optional[List[str]] = None,
     optim: bool = False,
+    counter: bool = False,
     pg: dist.ProcessGroup = dist.group.WORLD,
 ):
     """
@@ -219,6 +221,8 @@ def DynamicEmbLoad(
         and the value is a list of dynamic embedding table names within that collection. Defaults to None.
     optim : bool, optional
         Whether to load the optimizer states. Defaults to False.
+    counter : bool, optional
+        Whether to load the embedding admission counter table. Defaults to False.
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the load. Defaults to None.
 
@@ -260,6 +264,7 @@ def DynamicEmbLoad(
             dynamic_emb_module.load(
                 full_collection_path,
                 optim=optim,
+                counter=counter,
                 table_names=table_names_to_load,
                 pg=pg,
             )

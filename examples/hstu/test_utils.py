@@ -141,7 +141,7 @@ def compare_tpN_to_debug_optimizer_state(
 
 
 def compare_tpN_to_debug_weights(
-    tpN_module, debug_module, debug_fp32_module, include_grad: bool = True
+    tpN_module, debug_module, debug_fp32_module, include_grad: bool = True, msg=""
 ):
     import re
 
@@ -207,14 +207,14 @@ def compare_tpN_to_debug_weights(
             x is not None for x in [dst_grad, src_grad, src_grad_fp32]
         ):
             collective_assert(
-                hstu_close(dst_grad, src_grad, src_grad_fp32, multiplier=5),
-                f"grad mismatch at {name}, multiplier {(dst_grad - src_grad_fp32).abs().max() / (src_grad - src_grad_fp32).abs().max()}",
-                group=parallel_state.get_data_parallel_group(),
+                hstu_close(
+                    dst_grad, src_grad, src_grad_fp32, try_allclose=True, multiplier=5
+                ),
+                f"[rank{torch.distributed.get_rank()}, {msg}] grad mismatch at {name}, multiplier {(dst_grad - src_grad_fp32).abs().max() / (src_grad - src_grad_fp32).abs().max()}",
             )
         collective_assert(
             hstu_close(dst, src, src_fp32, try_allclose=True, multiplier=5),
-            f"weight mismatch at {name}  multiplier {(dst - src_fp32).abs().max() / (src - src_fp32).abs().max()}",
-            group=parallel_state.get_data_parallel_group(),
+            f"[rank{torch.distributed.get_rank()}, {msg}] weight mismatch at {name}  multiplier {(dst - src_fp32).abs().max() / (src - src_fp32).abs().max()}",
         )  # weight
 
 
@@ -319,6 +319,7 @@ def create_model(
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     num_batches: int = 10,
     replicate_batches: bool = True,
+    sequence_parallel: bool = False,
 ):
     init.set_random_seed(seed)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -338,6 +339,7 @@ def create_model(
         add_uvqk_bias=False,  # disable bias for better debugging
         fuse_norm_mul_dropout=False,  # disable fusion for better debugging
         learnable_input_layernorm=False,  # disable bias for better debugging
+        sequence_parallel=sequence_parallel,
     )
 
     item_feature_name = "item_feat"
@@ -484,6 +486,8 @@ def create_hstu_layer_and_optimizer(
     hstu_layer_type: HSTULayerType = HSTULayerType.DEBUG,
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     learnable_input_layernorm: bool = False,
+    learnable_output_layernorm: bool = False,
+    sequence_parallel: bool = False,
 ):
     hstu_config = configs.get_hstu_config(
         hidden_size=hidden_size,
@@ -498,11 +502,12 @@ def create_hstu_layer_and_optimizer(
         target_group_size=1,
         hstu_layer_type=hstu_layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
         residual=True,
         add_uvqk_bias=False,  # disable bias for better debugging
         fuse_norm_mul_dropout=False,  # disable fusion for better debugging
+        sequence_parallel=sequence_parallel,
     )
-    torch.cuda.current_device()
     if hstu_layer_type == HSTULayerType.DEBUG:
         hstu_layer = DebugHSTULayer(hstu_config).cuda()
     else:

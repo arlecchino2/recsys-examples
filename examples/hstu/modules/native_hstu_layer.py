@@ -34,7 +34,7 @@ from megatron.core.utils import divide
 from modules.hstu_attention import create_hstu_attention
 from modules.jagged_data import JaggedData
 from modules.tp_layer_norm import TPLayerNormMulDropout
-from ops.collective_ops import gather_along_last_dim
+from ops.collective_ops import gather_along_last_dim, split_along_first_dim
 from ops.triton_ops.triton_layer_norm import triton_layer_norm
 
 
@@ -80,6 +80,7 @@ class HSTULayer(MegatronModule):
             self.silu_checkpoint = CheckpointWithoutOutput()
         self._residual = config.residual
         device = torch.cuda.current_device()
+        self._sequence_parallel = config.sequence_parallel
         # input layernorm
         if config.learnable_input_layernorm:
             self._input_layernorm_weight = torch.nn.Parameter(
@@ -88,28 +89,35 @@ class HSTULayer(MegatronModule):
             self._input_layernorm_bias = torch.nn.Parameter(
                 torch.zeros(self._embedding_dim, device=device)
             )
+            # this flag will be used in finalize_model_grads!
+            # see https://github.com/NVIDIA/Megatron-LM/blob/core_v0.13.0/megatron/core/distributed/finalize_model_grads.py#L286-L288
+            self._input_layernorm_weight.sequence_parallel = self._sequence_parallel
+            self._input_layernorm_bias.sequence_parallel = self._sequence_parallel
         else:
             self._input_layernorm_weight = None
             self._input_layernorm_bias = None
+
+        self._learnable_output_layernorm = config.learnable_output_layernorm
         self._output_ln_dropout_mul = TPLayerNormMulDropout(
             hidden_size=self._num_heads * self._linear_dim_per_head,
             eps=self._eps,
-            trainable=True,
-            shard_weight=False,
+            trainable=self._learnable_output_layernorm,
             dropout_ratio=self._dropout_ratio,
             fusion=config.fuse_norm_mul_dropout,
+            sequence_parallel=config.sequence_parallel,
         )
         # [embedding_dim, 4 * num_head * head_dim]
         self._linear_uvqk = TEColumnParallelLinear(
             input_size=self._embedding_dim,
             output_size=sum(self._split_arg_list) * self._num_heads,
             init_method=config.init_method,
-            config=config,
+            config=config,  # sequence_parallel is handled in TEColumnParallelLinear, it will help ag along seq dim.
             bias=config.add_uvqk_bias,
             gather_output=False,
             skip_bias_add=False,  # note: TEColumnParallelLinear does not support bias fusion!
             is_expert=False,
         )
+
         self._debug_shortcut_proj_linear = (
             os.environ.get("DEBUG_SHORTCUT_PROJ_LINEAR", "0") == "1"
         )
@@ -120,14 +128,13 @@ class HSTULayer(MegatronModule):
             assert (
                 self._embedding_dim == self._linear_dim_per_head * self._num_heads
             ), "when shortcut proj linear is on, embedding dim must be equal to linear dim per head * num heads"
-
         self._linear_proj = TERowParallelLinear(
             input_size=self._linear_dim_per_head * self._num_heads,
             output_size=self._embedding_dim,
             init_method=config.init_method,
-            config=config,
+            config=config,  # sequence_parallel is handled in TEColumnParallelLinear
             input_is_parallel=True,
-            bias=False,
+            bias=False,  # there is no bias
             skip_bias_add=False,
             is_expert=False,
         )
@@ -210,8 +217,9 @@ class HSTULayer(MegatronModule):
                     self._input_layernorm_bias,
                 )
             else:
-                normed_x = triton_layer_norm(
+                normed_x = F.layer_norm(
                     x,
+                    normalized_shape=[self._embedding_dim],
                     weight=self._input_layernorm_weight,
                     bias=self._input_layernorm_bias,
                     eps=self._eps,
@@ -220,6 +228,7 @@ class HSTULayer(MegatronModule):
             tu, tv, tq, tk = self.get_user_value_query_key_tensors(normed_x)
         # TODO: remove contiguous once cutlass backend is ready
         with nvtx.annotate("hstu attn fwd", color="BLUE"):
+            # [ T, hidden_size_per_partition]
             jagged_attn_output = self._attn_func(
                 tq,
                 tk,
@@ -231,13 +240,31 @@ class HSTULayer(MegatronModule):
                 scaling_seqlen=jd.scaling_seqlen,
                 target_group_size=self._target_group_size,
             )
+            # TODO handle the padding in HSTU kernel
+            padding_length = jd.padding_length
+            if padding_length > 0:
+                last_valid_index = jd.seqlen_offsets[-1]
+                jagged_attn_output = (
+                    jagged_attn_output.clone()
+                )  # we need this clone otherwise it will be inplace operation
+                jagged_attn_output[
+                    last_valid_index : last_valid_index + padding_length, ...
+                ] = 0.0
 
+                def reset_padding_grad_hook(grad):
+                    grad[
+                        last_valid_index : last_valid_index + padding_length, ...
+                    ] = 0.0
+                    return grad
+
+                jagged_attn_output.register_hook(reset_padding_grad_hook)
         with nvtx.annotate("hstu norm mul dropout fwd", color="GREEN"):
             if self._debug_shortcut_output_ln_mul_dropout:
                 parallel_input = jagged_attn_output
             else:
-                parallel_input = self._output_ln_dropout_mul(jagged_attn_output, tu)
-
+                parallel_input = self._output_ln_dropout_mul(
+                    jagged_attn_output, tu
+                )  # [ T, hidden_size_per_partition]
         if self._recompute_input_silu:
             # when output grad (gemm dgrad) is computed, trigger the recompute of the silu
             # we discard here after tu is used
@@ -248,17 +275,24 @@ class HSTULayer(MegatronModule):
             if self._debug_shortcut_proj_linear:
                 output = gather_along_last_dim(
                     parallel_input, parallel_state.get_tensor_model_parallel_group()
-                )
+                )  # [ T , hidden_size]
+                if self._sequence_parallel:
+                    # scatter
+                    output = split_along_first_dim(
+                        output, parallel_state.get_tensor_model_parallel_group()
+                    )  # [ T / tp_size, hidden_size]
             else:
-                output, _ = self._linear_proj(parallel_input)
+                output, _ = self._linear_proj(
+                    parallel_input
+                )  # when sequence parallel is on, the output is scattered
 
             if self._residual:
                 output = output + x
-
         return JaggedData(
             values=output,
             seqlen=jd.seqlen,
             seqlen_offsets=jd.seqlen_offsets,
+            padding_length=jd.padding_length,  # inherit from the input jagged data
             max_seqlen=jd.max_seqlen,
             max_num_candidates=jd.max_num_candidates,
             num_candidates=jd.num_candidates,

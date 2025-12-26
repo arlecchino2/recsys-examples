@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from dataclasses import dataclass
 from enum import Enum, unique
 from typing import Optional
@@ -116,6 +117,7 @@ class HSTUConfig(TransformerConfig):
 
     target_group_size: int = 1
     learnable_input_layernorm: bool = True
+    learnable_output_layernorm: bool = True
     # whether to add residual connection
     residual: bool = True
     # whether to use async wgrad
@@ -149,7 +151,9 @@ def get_hstu_config(
     kernel_backend: KernelBackend = KernelBackend.CUTLASS,
     target_group_size: int = 1,
     hstu_layer_type: HSTULayerType = HSTULayerType.FUSED,
+    sequence_parallel: bool = False,
     learnable_input_layernorm: bool = True,
+    learnable_output_layernorm: bool = True,
     residual: bool = True,
     async_wgrad: bool = False,
     recompute_input_layernorm: bool = False,
@@ -193,6 +197,10 @@ def get_hstu_config(
     else:
         async_wgrad_stream = None
         async_wgrad_event = None
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    if tp_size == 1:
+        warnings.warn("TP size is 1, setting sequence parallel to False")
+        sequence_parallel = False
     return HSTUConfig(  # type: ignore
         hstu_preprocessing_config=hstu_preprocessing_config,
         position_encoding_config=position_encoding_config,
@@ -203,21 +211,21 @@ def get_hstu_config(
         layernorm_epsilon=norm_epsilon,
         num_layers=num_layers,
         bf16=is_bf16,
-        tensor_model_parallel_size=parallel_state.get_tensor_model_parallel_world_size()
-        if not is_inference
-        else 1,
+        tensor_model_parallel_size=tp_size if not is_inference else 1,
         pipeline_model_parallel_size=parallel_state.get_pipeline_model_parallel_world_size()
         if not is_inference
         else 1,
         context_parallel_size=parallel_state.get_pipeline_model_parallel_world_size()
         if not is_inference
         else 1,
+        sequence_parallel=sequence_parallel,
         fp16=is_fp16,
         is_causal=is_causal,
         kernel_backend=kernel_backend,
         target_group_size=target_group_size,
         hstu_layer_type=hstu_layer_type,
         learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
         residual=residual,
         async_wgrad=async_wgrad,
         async_wgrad_stream=async_wgrad_stream,

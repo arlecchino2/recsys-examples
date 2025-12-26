@@ -126,12 +126,25 @@ def encode_checkpoint_file_path(
     )
 
 
+def encode_counter_checkpoint_file_path(
+    root_path: str, table_name: str, rank: int, world_size: int, item: str
+) -> str:
+    assert item in ["keys", "frequencies"]
+    return os.path.join(
+        root_path, f"{table_name}_counter_{item}.rank_{rank}.world_size_{world_size}"
+    )
+
+
 def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str], int]:
     suffix_to_encode_file_path_func = {
         "emb_keys": partial(encode_checkpoint_file_path, item="keys"),
         "emb_values": partial(encode_checkpoint_file_path, item="values"),
         "emb_scores": partial(encode_checkpoint_file_path, item="scores"),
         "opt_values": partial(encode_checkpoint_file_path, item="opt_values"),
+        "counter_keys": partial(encode_counter_checkpoint_file_path, item="keys"),
+        "counter_frequencies": partial(
+            encode_counter_checkpoint_file_path, item="frequencies"
+        ),
     }
     if suffix not in suffix_to_encode_file_path_func:
         raise RuntimeError(f"Invalid suffix: {suffix}")
@@ -182,6 +195,23 @@ def get_loading_files(
             f"The number of key files under path {root_path} for table {name} does not match the number of value files."
         )
 
+    counter_key_files, num_counter_key_files = find_files(
+        root_path, name, "counter_keys"
+    )
+    counter_freq_files, num_counter_freq_files = find_files(
+        root_path, name, "counter_frequencies"
+    )
+
+    if num_counter_key_files != num_counter_freq_files:
+        raise RuntimeError(
+            f"The number of key files of admission counter under path {root_path} for table {name} does not match the number of frequency files({num_counter_key_files}/{num_counter_freq_files})."
+        )
+
+    if num_counter_key_files > 0 and num_counter_key_files != num_key_files:
+        raise RuntimeError(
+            f"The number of key files under path {root_path} for table {name} does not match the number of keys files of admission counter({num_key_files}/{num_counter_key_files})."
+        )
+
     if world_size == num_key_files:
         return (
             [encode_checkpoint_file_path(root_path, name, rank, world_size, "keys")],
@@ -196,6 +226,20 @@ def get_loading_files(
             ]
             if num_opt_files == num_key_files
             else [],
+            [
+                encode_counter_checkpoint_file_path(
+                    root_path, name, rank, world_size, "keys"
+                )
+            ]
+            if num_counter_key_files == num_key_files
+            else [],
+            [
+                encode_counter_checkpoint_file_path(
+                    root_path, name, rank, world_size, "frequencies"
+                )
+            ]
+            if num_counter_freq_files == num_key_files
+            else [],
         )
     # TODO: support skipping files.
     return (
@@ -203,6 +247,8 @@ def get_loading_files(
         value_files,
         score_files,
         opt_files,
+        counter_key_files,
+        counter_freq_files,
     )
 
 
@@ -229,6 +275,7 @@ def _export_matched_and_gather(
     key_dtype = dynamic_table.key_type()
     value_dtype = dynamic_table.value_type()
     dim: int = dynamic_table.embedding_dim()
+    total_dim = dynamic_table.value_dim()
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
     ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
@@ -236,15 +283,15 @@ def _export_matched_and_gather(
 
     search_offset = 0
     search_capacity = dynamic_table.capacity()
-    batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_vals = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_embs = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
     d_count = torch.zeros(1, dtype=torch.uint64, device=device)
 
     # Gather keys and values for all ranks
     gathered_keys = [torch.empty_like(d_keys) for _ in range(world_size)]
-    gathered_vals = [torch.empty_like(d_vals) for _ in range(world_size)]
+    gathered_vals = [torch.empty_like(d_embs) for _ in range(world_size)]
     gathered_counts = [
         torch.empty_like(d_count, dtype=torch.int64) for _ in range(world_size)
     ]
@@ -254,8 +301,9 @@ def _export_matched_and_gather(
             threshold, batch_size, search_offset, d_count, d_keys, d_vals
         )
 
+        d_embs = d_vals.view(batch_size, total_dim)[:, :dim].reshape(-1)
         dist.all_gather(gathered_keys, d_keys, group=pg)
-        dist.all_gather(gathered_vals, d_vals, group=pg)
+        dist.all_gather(gathered_vals, d_embs, group=pg)
         dist.all_gather(gathered_counts, d_count.to(dtype=torch.int64), group=pg)
 
         for d_keys_, d_vals_, d_count_ in zip(
@@ -287,6 +335,7 @@ def _export_matched(
     key_dtype = dynamic_table.key_type()
     value_dtype = dynamic_table.value_type()
     dim: int = dynamic_table.embedding_dim()
+    total_dim = dynamic_table.value_dim()
 
     ret_keys = torch.empty(total_matched, dtype=key_dtype, device="cpu")
     ret_vals = torch.empty(total_matched * dim, dtype=value_dtype, device="cpu")
@@ -297,7 +346,7 @@ def _export_matched(
     batch_size = batch_size if batch_size < search_capacity else search_capacity
 
     d_keys = torch.empty(batch_size, dtype=key_dtype, device=device)
-    d_vals = torch.empty(batch_size * dim, dtype=value_dtype, device=device)
+    d_vals = torch.empty(batch_size * total_dim, dtype=value_dtype, device=device)
     d_count = torch.zeros(1, dtype=torch.uint64, device=device)
 
     while search_offset < search_capacity:
@@ -307,9 +356,9 @@ def _export_matched(
 
         h_count = d_count.cpu().item()
         ret_keys[ret_offset : ret_offset + h_count] = d_keys[0:h_count].cpu()
-        ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = d_vals[
-            0 : h_count * dim
-        ].cpu()
+        ret_vals[ret_offset * dim : (ret_offset + h_count) * dim] = (
+            d_vals.view(batch_size, total_dim)[:h_count, :dim].reshape(-1).cpu()
+        )
         ret_offset += h_count
 
         search_offset += batch_size
@@ -483,7 +532,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
-
+        self._admit_strategy = self._dynamicemb_options[0].admit_strategy
+        self._evict_strategy = self._dynamicemb_options[0].evict_strategy.value
         if device is not None:
             self.device_id = int(str(device)[-1])
         else:
@@ -586,6 +636,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._eval_initializers = []
         self._create_initializers()
 
+        self._admission_counter = [option.admission_counter for option in table_options]
+
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
             torch.empty(
@@ -663,28 +715,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
 
     def _create_initializers(self) -> None:
-        def _get_initializer(initializer_args):
-            mode = initializer_args.mode
-            if mode == DynamicEmbInitializerMode.NORMAL:
-                initializer = NormalInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.TRUNCATED_NORMAL:
-                initializer = TruncatedNormalInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.UNIFORM:
-                initializer = UniformInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.CONSTANT:
-                initializer = ConstantInitializer(initializer_args)
-            elif mode == DynamicEmbInitializerMode.DEBUG:
-                initializer = DebugInitializer(initializer_args)
-            else:
-                raise ValueError(
-                    f"Not supported initializer type({mode}) {type(mode)} {mode.value}."
-                )
-            return initializer
-
         for option in self._dynamicemb_options:
-            initializer = _get_initializer(option.initializer_args)
+            initializer = create_initializer_from_args(option.initializer_args)
             self._initializers.append(initializer)
-            eval_initializer = _get_initializer(option.eval_initializer_args)
+            eval_initializer = create_initializer_from_args(
+                option.eval_initializer_args
+            )
             self._eval_initializers.append(eval_initializer)
 
     def _create_bag_optimizer(
@@ -983,7 +1019,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._enable_prefetch,
                 self.use_index_dedup,
                 self.training,
+                self._admit_strategy,
+                self._evict_strategy,
                 per_sample_weights,  # Pass frequency counters as weights
+                self._admission_counter,
                 self._empty_tensor,
             )
             for cache in self._caches:
@@ -1184,6 +1223,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self,
         save_dir: str,
         optim: bool = False,
+        counter: bool = False,
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
@@ -1197,7 +1237,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         world_size = dist.get_world_size(group=pg)
 
         self.flush()
-        for table_name, storage in zip(self._table_names, self._storages):
+        for table_name, storage, counter_table in zip(
+            self._table_names, self._storages, self._admission_counter
+        ):
             if table_name not in set(table_names):
                 continue
 
@@ -1215,6 +1257,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 save_dir, table_name, rank, world_size, "opt_values"
             )
 
+            if isinstance(storage, KeyValueTable) and not storage._use_score:
+                dist.barrier()  # sync global timestamp
+                cast(KeyValueTable, storage).update_timestamp()
             storage.dump(
                 meta_file_path,
                 emb_key_path,
@@ -1225,10 +1270,28 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 include_meta=(rank == 0),
             )
 
+            if not counter:
+                continue
+
+            counter_key_path = encode_counter_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "keys"
+            )
+            counter_frequency_path = encode_counter_checkpoint_file_path(
+                save_dir, table_name, rank, world_size, "frequencies"
+            )
+
+            if counter_table is not None:
+                counter_table.dump(counter_key_path, counter_frequency_path)
+            else:
+                warnings.warn(
+                    f"Counter table is none and will not dump it for table: {table_name}"
+                )
+
     def load(
         self,
         save_dir: str,
         optim: bool = False,
+        counter: bool = False,
         table_names: Optional[List[str]] = None,
         pg: Optional[dist.ProcessGroup] = None,
     ):
@@ -1242,7 +1305,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             rank = dist.get_rank(group=pg)
             world_size = dist.get_world_size(group=pg)
 
-        for table_name, storage in zip(self._table_names, self._storages):
+        for table_name, storage, counter_table in zip(
+            self._table_names, self._storages, self._admission_counter
+        ):
             if table_name not in set(table_names):
                 continue
             (
@@ -1250,6 +1315,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 emb_value_files,
                 emb_score_files,
                 opt_value_files,
+                counter_key_files,
+                counter_frequency_files,
             ) = get_loading_files(
                 save_dir,
                 table_name,
@@ -1258,6 +1325,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
             meta_json_file = encode_meta_json_file_path(save_dir, table_name)
 
+            if isinstance(storage, KeyValueTable) and not storage._use_score:
+                cast(KeyValueTable, storage).update_timestamp()
             num_key_files = len(emb_key_files)
             for i in range(num_key_files):
                 storage.load(
@@ -1268,6 +1337,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     opt_value_files[i] if len(opt_value_files) > 0 else None,
                     include_optim=optim,
                 )
+
+            if not counter:
+                continue
+            if counter_table is None:
+                warnings.warn(
+                    f"Counter table is none and will not load for table: {table_name}"
+                )
+                continue
+            num_counter_key_files = len(counter_key_files)
+            for i in range(num_counter_key_files):
+                counter_table.load(counter_key_files[i], counter_frequency_files[i])
 
     def export_keys_values(
         self, table_name: str, device: torch.device, batch_size: int = 65536

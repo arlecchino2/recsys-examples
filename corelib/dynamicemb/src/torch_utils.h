@@ -1,6 +1,6 @@
 /******************************************************************************
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,9 +27,9 @@
 #include "ATen/AccumulateType.h"
 #include <pybind11/pybind11.h>
 // #include <torch/python.h>
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
-#include <cstdint>
 
 namespace dyn_emb {
 
@@ -41,11 +41,33 @@ namespace dyn_emb {
 // c10::ScalarType
 DataType scalartype_to_datatype(at::ScalarType scalar_type);
 at::ScalarType datatype_to_scalartype(dyn_emb::DataType dtype);
-at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta& typeMeta);
+at::ScalarType convertTypeMetaToScalarType(const caffe2::TypeMeta &typeMeta);
 
 uint64_t device_timestamp();
 
+inline DataType get_data_type(at::Tensor tensor) {
+  return scalartype_to_datatype(tensor.dtype().toScalarType());
+}
+
+template <typename T> T *get_pointer(at::Tensor tensor) {
+  if (not tensor.defined()) {
+    throw std::invalid_argument("Tensor is undefined.");
+  }
+  return static_cast<T *>(tensor.data_ptr());
+}
+
+template <typename T> T *get_pointer(const std::optional<at::Tensor> &tensor) {
+  if (not tensor.has_value()) {
+    return nullptr;
+  }
+  auto value = tensor.value();
+  if (not value.defined()) {
+    throw std::invalid_argument("Tensor is undefined.");
+  }
+  return static_cast<T *>(value.data_ptr());
+}
+
 } // namespace dyn_emb
 
-//PYTHON WRAP
-void bind_utils(py::module& m);
+// PYTHON WRAP
+void bind_utils(py::module &m);

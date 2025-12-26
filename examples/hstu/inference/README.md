@@ -72,11 +72,14 @@ Turn on option `INFERENCEBUILD=1` to skip Megatron installation, which is not re
 ## Example: Kuairand-1K
 
 ```
+~$ cd recsys-examples/examples/hstu
+~$ export PYTHONPATH=${PYTHONPATH}:$(realpath ../)
+~$ 
 ~$ # Proprocess the dataset for inference:
 ~$ python3 ./preprocessor.py --dataset_name "kuairand-1k" --inference
 ~$
 ~$ # Run the inference example
-~$ python3 ./inference_gr_ranking_async.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT} --mode eval
+~$ python3 ./inference/inference_gr_ranking_async.py --gin_config_file ./inference/configs/kuairand_1k_inference_ranking.gin --checkpoint_dir ${PATH_TO_CHECKPOINT}  --mode eval
 ```
 
 ## Consistency Check for Inference

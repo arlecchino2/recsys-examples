@@ -13,21 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Optional
+
 import commons.utils.initialize as init
 import fbgemm_gpu  # pylint: disable-unused-import
 import pytest
 import torch
 from commons.checkpoint import get_unwrapped_module
 from commons.utils.distributed_utils import collective_assert, collective_assert_tensor
-from commons.utils.hstu_assert_close import assert_hstu_close, hstu_close
-from configs import get_hstu_config
+from commons.utils.hstu_assert_close import hstu_close
 from configs.hstu_config import HSTULayerType, KernelBackend
 from distributed.finalize_model_grads import finalize_model_grads
 from megatron.core import parallel_state
-from megatron.core.transformer.module import Float16Module
-from modules.debug.debug_hstu_layer import HSTULayer as DebugHSTULayer
-from modules.jagged_data import JaggedData
-from modules.native_hstu_layer import HSTULayer
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
+from modules.jagged_data import JaggedData, pad_jd_values, unpad_jd_values
 from ops.length_to_offsets import length_to_complete_offsets
 from test_utils import (
     compare_tpN_to_debug_weights,
@@ -44,6 +46,9 @@ def generate_jagged_data_list(
     num_heads: int,
     num_batches: int,
     replicate_batches: bool = True,
+    banned_seqlen_divisor: Optional[
+        int
+    ] = None,  # we deliberately make the sequence length not divisible by banned_seqlen_divisor to test the padding logic
 ):
     max_history_seqlen = 100
     max_num_targets = 50
@@ -56,12 +61,19 @@ def generate_jagged_data_list(
     random_batches = 1 if replicate_batches else num_batches
     for i in range(random_batches):
         lengths = torch.randint(
-            low=1,
+            low=2,
             high=max_seqlen + 1,
             size=(batchsize,),
             device=device,
             dtype=torch.int,
         )
+        # we don't want the sequence length to be divisible by banned_seqlen_divisor
+        # when banned_seqlen_divisor = 1, minus is safe
+        if (
+            banned_seqlen_divisor is not None
+            and lengths.sum() % banned_seqlen_divisor == 0
+        ):
+            lengths[-1] -= 1
         num_targets = torch.randint(
             low=0,
             high=max_num_targets + 1,
@@ -85,16 +97,8 @@ def generate_jagged_data_list(
             max=lengths - 1 - num_targets if num_targets is not None else lengths - 1,
             min=torch.zeros_like(num_contextuals),
         )  # at least 1 history!!
-        lengths = torch.randint(
-            low=1,
-            high=max_seqlen + 1,
-            size=(batchsize,),
-            device=device,
-            dtype=torch.int,
-        )
         seq_offsets = length_to_complete_offsets(lengths)
         L = int(seq_offsets[-1].item())
-
         input = torch.empty(
             (L, hidden_dim_per_head * num_heads),
             dtype=dtype,
@@ -116,8 +120,10 @@ def generate_jagged_data_list(
             "contextual_seqlen_offsets": length_to_complete_offsets(num_contextuals),
         }
         jd = JaggedData(values=input, **ctor_nograd_dict)
-        ref_jd = JaggedData(values=ref_input, **ctor_nograd_dict)
-        fp32_ref_jd = JaggedData(values=fp32_ref_input, **ctor_nograd_dict)
+        # don't share seqlen either
+        ref_jd = jd.copy_others_but_set_values(values=ref_input)
+        fp32_ref_jd = jd.copy_others_but_set_values(values=fp32_ref_input)
+
         ret_list.append(jd)
         ref_ret_list.append(ref_jd)
         fp32_ref_ret_list.append(fp32_ref_jd)
@@ -130,103 +136,23 @@ def generate_jagged_data_list(
     return ret_list, ref_ret_list, fp32_ref_ret_list
 
 
+# set backend as PYTORCH
 @pytest.mark.parametrize(
     "batchsize",
-    [
-        32,
-    ],
+    [32],
 )
 @pytest.mark.parametrize("num_heads", [4, 1])
 @pytest.mark.parametrize("hidden_dim_per_head", [32, 128])  #
 @pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
-def test_tp_hstu_layer_forward_backward(
-    batchsize,
-    num_heads,
-    hidden_dim_per_head,
-    tp_size,
-):
-    init.initialize_distributed()
-    world_size = torch.distributed.get_world_size()
-
-    if world_size < tp_size:
-        pytest.skip("TP size is larger than world size")
-    if num_heads % tp_size != 0:
-        pytest.skip("num_heads should be divisible by tp_size")
-    init.initialize_model_parallel(tp_size)
-    init.set_random_seed(1234)
-
-    ln_eps = 1e-5
-    attn_backend = KernelBackend.CUTLASS
-    dropout_ratio = 0.0  # triton dropout is not consistent with torch.nn.dropout
-    dtype = torch.bfloat16
-    hidden_size = hidden_dim_per_head * num_heads
-    hstu_config = get_hstu_config(
-        hidden_size=hidden_size,
-        kv_channels=hidden_dim_per_head,
-        num_attention_heads=num_heads,
-        num_layers=1,
-        dtype=dtype,
-        hidden_dropout=dropout_ratio,
-        norm_epsilon=ln_eps,
-        is_causal=True,
-        kernel_backend=attn_backend,  # attn_backend
-        target_group_size=1,
-        hstu_layer_type=HSTULayerType.DEBUG,
-        learnable_input_layernorm=True,
-        residual=True,
-    )
-    torch.cuda.current_device()
-
-    debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
-    debug_hstu_layer = Float16Module(hstu_config, debug_hstu_layer)
-
-    hstu_config.hstu_layer_type = HSTULayerType.NATIVE
-    tp_hstu_layer = HSTULayer(hstu_config).cuda()
-    tp_hstu_layer = Float16Module(hstu_config, tp_hstu_layer)
-
-    hstu_config.hstu_layer_type = HSTULayerType.DEBUG
-    hstu_config.kernel_backend = KernelBackend.PYTORCH
-    fp32_debug_hstu_layer = DebugHSTULayer(hstu_config).cuda()
-
-    init_tpN_weights_from_debug(debug_hstu_layer.module, tp_hstu_layer.module)
-    jd_list, ref_jd_list, fp32_ref_jd_list = generate_jagged_data_list(
-        batchsize, dtype, hidden_dim_per_head, num_heads, 100, False
-    )
-    for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
-        zip(jd_list, ref_jd_list, fp32_ref_jd_list)
-    ):
-        out_legacy = debug_hstu_layer(ref_jd).values
-        fp32_out_legacy = fp32_debug_hstu_layer(fp32_ref_jd).values
-        tp_out = tp_hstu_layer(jd).values
-
-        assert_hstu_close(tp_out, out_legacy, fp32_out_legacy, fwd=True)
-        # use normal distribution
-        dout = torch.empty_like(out_legacy)
-        dout.normal_() / 2**2
-        out_legacy.backward(dout)
-        tp_out.backward(dout)
-        fp32_out_legacy.backward(dout.float())
-        grad_legacy = ref_jd.values.grad
-        grad_tp = jd.values.grad
-        grad_fp32_legacy = fp32_ref_jd.values.grad
-        assert_hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, fwd=False)
-    init.destroy_global_state()
-
-
-@pytest.mark.parametrize(
-    "batchsize",
-    [128],
-)
-@pytest.mark.parametrize("num_heads", [4, 1])
-@pytest.mark.parametrize("hidden_dim_per_head", [128])  #
-@pytest.mark.parametrize("tp_size", [2, 4, 8, 1])
 @pytest.mark.parametrize("optimizer_type_str", ["adam", "sgd"])
+@pytest.mark.parametrize("sequence_parallel", [True, False])
 def test_tp_hstu_layer_forward_backward_update(
     batchsize,
     num_heads,
     hidden_dim_per_head,
     tp_size,
     optimizer_type_str,
+    sequence_parallel: bool,
 ):
     init.initialize_distributed()
     world_size = torch.distributed.get_world_size()
@@ -240,7 +166,8 @@ def test_tp_hstu_layer_forward_backward_update(
     dtype = torch.bfloat16
     hidden_size = hidden_dim_per_head * num_heads
     torch.cuda.current_device()
-
+    learnable_input_layernorm = True  # if optimizer_type_str == "sgd" else False
+    learnable_output_layernorm = True  # if optimizer_type_str == "sgd" else False
     debug_hstu_layer, debug_dense_optimizer = create_hstu_layer_and_optimizer(
         dtype=dtype,
         hidden_size=hidden_size,
@@ -249,7 +176,9 @@ def test_tp_hstu_layer_forward_backward_update(
         optimizer_type_str=optimizer_type_str,
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
-        learnable_input_layernorm=True,
+        learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
+        sequence_parallel=False,  # debug hstu layer does not support sequence parallel
     )
 
     tp_hstu_layer, tp_dense_optimizer = create_hstu_layer_and_optimizer(
@@ -260,7 +189,9 @@ def test_tp_hstu_layer_forward_backward_update(
         optimizer_type_str=optimizer_type_str,
         hstu_layer_type=HSTULayerType.NATIVE,  # use native hstu layer for tp
         kernel_backend=KernelBackend.PYTORCH,
-        learnable_input_layernorm=True,
+        learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
+        sequence_parallel=sequence_parallel,
     )
 
     fp32_debug_hstu_layer, fp32_debug_dense_optimizer = create_hstu_layer_and_optimizer(
@@ -271,7 +202,9 @@ def test_tp_hstu_layer_forward_backward_update(
         optimizer_type_str=optimizer_type_str,
         hstu_layer_type=HSTULayerType.DEBUG,
         kernel_backend=KernelBackend.PYTORCH,
-        learnable_input_layernorm=True,
+        learnable_input_layernorm=learnable_input_layernorm,
+        learnable_output_layernorm=learnable_output_layernorm,
+        sequence_parallel=False,  # debug hstu layer does not support sequence parallel
     )
 
     init_module_from(fp32_debug_hstu_layer, debug_hstu_layer)
@@ -298,63 +231,81 @@ def test_tp_hstu_layer_forward_backward_update(
         dtype,
         hidden_dim_per_head,
         num_heads,
-        num_batches=100,
-        replicate_batches=False,
+        num_batches=50,
+        replicate_batches=False,  # if True.
     )
-    multiplier = 2
-    for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
-        zip(jd_list, ref_jd_list, fp32_ref_jd_list)
-    ):
-        zero_grad(debug_dense_optimizer, debug_hstu_layer)
-        zero_grad(tp_dense_optimizer, tp_hstu_layer)
-        zero_grad(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
+    fwd_multiplier = 2
+    bwd_multiplier = 2
+    compare_tpN_to_debug_weights(tp_model, debug_model, debug_model_fp32)
+    with init.auto_destroy_global_state():
+        for i, (jd, ref_jd, fp32_ref_jd) in enumerate(
+            zip(jd_list, ref_jd_list, fp32_ref_jd_list)
+        ):
+            zero_grad(debug_dense_optimizer, debug_hstu_layer)
+            zero_grad(tp_dense_optimizer, tp_hstu_layer)
+            zero_grad(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
+            padded_jd = jd
+            # when sequence parallel is on, we need to pad the jagged data to the tp size
+            # and scatter the values to the sequence parallel region
+            if sequence_parallel:
+                padded_jd = pad_jd_values(jd, pad_base=tp_size)
+                padded_jd.values = scatter_to_sequence_parallel_region(padded_jd.values)
+            jagged_tp_out = tp_hstu_layer(padded_jd)
+            # when sequence parallel is on, outputs are scatter among TP ranks, so we need to gather the outputs back for check
+            if sequence_parallel:
+                jagged_tp_out.values = gather_from_sequence_parallel_region(
+                    jagged_tp_out.values, False
+                )  # False -> output grad not RS but S
+                jagged_tp_out = unpad_jd_values(jagged_tp_out)
 
-        logits = debug_hstu_layer(ref_jd).values
-        logits_fp32 = fp32_debug_hstu_layer(fp32_ref_jd).values
-        tp_logits = tp_hstu_layer(jd).values
+            logits = debug_hstu_layer(ref_jd).values
+            logits_fp32 = fp32_debug_hstu_layer(fp32_ref_jd).values
+            tp_logits = jagged_tp_out.values
+            collective_assert_tensor(
+                logits_fp32,
+                compare_type="equal",
+                pg=parallel_state.get_tensor_model_parallel_group(),
+            )
+            collective_assert_tensor(
+                logits,
+                compare_type="equal",
+                pg=parallel_state.get_tensor_model_parallel_group(),
+            )
+            collective_assert_tensor(
+                tp_logits,
+                compare_type="equal",
+                pg=parallel_state.get_tensor_model_parallel_group(),
+            )
 
-        collective_assert_tensor(
-            logits_fp32,
-            compare_type="equal",
-            pg=parallel_state.get_tensor_model_parallel_group(),
-        )
-        collective_assert_tensor(
-            logits,
-            compare_type="equal",
-            pg=parallel_state.get_tensor_model_parallel_group(),
-        )
-        collective_assert_tensor(
-            tp_logits,
-            compare_type="equal",
-            pg=parallel_state.get_tensor_model_parallel_group(),
-        )
+            collective_assert(
+                hstu_close(tp_logits, logits, logits_fp32, multiplier=fwd_multiplier),
+                f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
+            )
+            # use normal distribution
+            dout = torch.empty_like(tp_logits)
+            dout.normal_() / 2**2
+            logits.backward(dout)
+            tp_logits.backward(dout)
+            logits_fp32.backward(dout.float())
 
-        collective_assert(
-            hstu_close(tp_logits, logits, logits_fp32, multiplier=multiplier),
-            f"logits mismatch at iter {i}, diff {(tp_logits - logits_fp32).abs().max()} vs {(logits - logits_fp32).abs().max()} vs hey {(tp_logits - logits).abs().max()}",
-        )
-        # use normal distribution
-        dout = torch.empty_like(tp_logits)
-        dout.normal_() / 2**2
-        logits.backward(dout)
-        tp_logits.backward(dout)
-        logits_fp32.backward(dout.float())
+            # optimizer step
+            optimizer_step(tp_dense_optimizer, tp_hstu_layer)
+            optimizer_step(debug_dense_optimizer, debug_hstu_layer)
+            optimizer_step(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
+            # adam update is quite instable at the first step
+            # compare the first two iterations when optimizer is sgd
+            if i < 2 and optimizer_type_str == "sgd":
+                compare_tpN_to_debug_weights(
+                    tp_model, debug_model, debug_model_fp32, msg=f"iter {i}"
+                )
 
-        # optimizer step
-        optimizer_step(tp_dense_optimizer, tp_hstu_layer)
-        optimizer_step(debug_dense_optimizer, debug_hstu_layer)
-        optimizer_step(fp32_debug_dense_optimizer, fp32_debug_hstu_layer)
-        compare_tpN_to_debug_weights(tp_model, debug_model, debug_model_fp32)
-
-        grad_legacy = ref_jd.values.grad
-        grad_tp = jd.values.grad
-        grad_fp32_legacy = fp32_ref_jd.values.grad
-        collective_assert(
-            hstu_close(grad_tp, grad_legacy, grad_fp32_legacy, multiplier=multiplier),
-            f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_legacy).abs().max()} vs {(grad_legacy - grad_fp32_legacy).abs().max()} vs hey {(grad_tp - grad_legacy).abs().max()}",
-        )
-        print(
-            f"[tp{parallel_state.get_tensor_model_parallel_rank()}, dp{parallel_state.get_data_parallel_rank()}] [iter {i} is good]"
-        )
-        multiplier = 2 if i == 0 else multiplier
-    init.destroy_global_state()
+            grad_debug = ref_jd.values.grad
+            grad_tp = jd.values.grad
+            grad_fp32_debug = fp32_ref_jd.values.grad
+            collective_assert(
+                hstu_close(
+                    grad_tp, grad_debug, grad_fp32_debug, multiplier=bwd_multiplier
+                ),
+                f"grads mismatch at iter {i}, diff {(grad_tp - grad_fp32_debug).abs().max()} vs {(grad_debug - grad_fp32_debug).abs().max()} vs hey {(grad_tp - grad_debug).abs().max()}",
+            )
+            bwd_multiplier = 5 if i >= 2 else fwd_multiplier

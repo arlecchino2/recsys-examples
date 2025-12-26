@@ -8,8 +8,8 @@ We provide a set of benchmarks for HSTU Inference on end-to-end inference and pa
 ```bash
 ~$ cd recsys-examples/examples/hstu
 ~$ export PYTHONPATH=${PYTHONPATH}:$(realpath ../)
-~$ python3 ./benchmark/inference_benchmark.py
-~$ python3 ./benchmark/paged_hstu_with_kvcache_benchmark.py
+~$ python3 ./inference/benchmark/inference_benchmark.py
+~$ python3 ./inference/benchmark/paged_hstu_with_kvcache_benchmark.py
 ```
 
 ## Benchmark results
