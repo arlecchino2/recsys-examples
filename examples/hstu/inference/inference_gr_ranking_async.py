@@ -52,7 +52,7 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_12_23"
+log_dir = "./logs/logs_12_25"
 # log_dir = "./logs_without_kv/logs_12_23"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
@@ -193,7 +193,7 @@ def get_inference_hstu_model(
         # "blocks_in_primary_pool": 10240,
         "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,
-        "offload_chunksize": 512, 
+        "offload_chunksize": 4096, 
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -332,7 +332,7 @@ def run_ranking_gr_simulate(
                     #     logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
                     #     print(f"{num_batches_ctr}, uids: {uids.tolist()}")
                         # print(uids, dates, seq_endptrs)
-                    logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}")
+                    logger.info(f"{num_batches_ctr}, uids: {uids.tolist()}, seq_endptrs: {seq_endptrs.tolist()}")
                     print(f"{num_batches_ctr}, uids: {uids.tolist()}")
                     if dates[0] != cur_date:
                         # if cur_date is not None:

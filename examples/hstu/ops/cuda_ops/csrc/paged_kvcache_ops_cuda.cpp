@@ -100,6 +100,23 @@ cudaError_t GatherPagedKVCacheAllLayers(DType* gather_kv,
                                         uint32_t nnz,
                                         cudaStream_t stream);
 
+template <typename DType, typename IdType>
+cudaError_t ScatterPagedKVCacheAllLayers(DType* continuous_kv_buffer,
+                                         IdType* target_page_ids,
+                                         uint32_t num_layers,
+                                         uint32_t stride_continuous,
+                                         uint32_t stride_target,
+                                         uint32_t num_heads,
+                                         uint32_t head_dim,
+                                         uint32_t page_size,
+                                         uint32_t stride_page,
+                                         uint32_t stride_k2v,
+                                         uint32_t stride_n,
+                                         uint32_t stride_h,
+                                         DType* paged_kv_cache,
+                                         uint32_t nnz,
+                                         cudaStream_t stream);
+
 cudaError_t GetPagedBatchIndicesPositions(
   int32_t batch_size,
   int32_t* append_indptr,
@@ -283,6 +300,34 @@ void gather_paged_kv_cache_all_layers(uint16_t *gather_kv_gpu_buffer,
       num_pages * page_size, stream);
   TORCH_CHECK(status == cudaSuccess,
               "GatherPagedKVCacheAllLayers failed with error: ", cudaGetErrorString(status));
+}
+
+void scatter_paged_kv_cache_all_layers(uint16_t *continuous_kv_buffer,
+                                      uint16_t *paged_kv_cache,
+                                      int *target_page_ids,
+                                      uint32_t num_layers,
+                                      uint32_t stride_continuous,
+                                      uint32_t stride_target,
+                                      uint32_t num_heads,
+                                      uint32_t head_dim,
+                                      uint32_t page_size,
+                                      uint32_t stride_page,
+                                      uint32_t stride_k2v,
+                                      uint32_t stride_n,
+                                      uint32_t stride_h,
+                                      uint32_t num_pages,
+                                      cudaStream_t stream) {
+  cudaError_t status;
+  status = ScatterPagedKVCacheAllLayers(
+      reinterpret_cast<nv_bfloat16*>(continuous_kv_buffer),
+      static_cast<int32_t*>(target_page_ids),
+      num_layers, stride_continuous, stride_target, 
+      num_heads, head_dim, page_size, 
+      stride_page, stride_k2v, stride_n, stride_h,
+      reinterpret_cast<nv_bfloat16*>(paged_kv_cache),
+      num_pages * page_size, stream);
+  TORCH_CHECK(status == cudaSuccess,
+              "ScatterPagedKVCacheAllLayers failed with error: ", cudaGetErrorString(status));
 }
 
 namespace kvcache {
@@ -831,6 +876,16 @@ public:
             cudaEventDestroy(onload_memcpy_event[i]);
             cudaEventDestroy(offload_memcpy_event[i]);
         }
+
+        {
+            std::unique_lock<std::mutex> lock(pending_sync_mutex_);
+            for (void* ptr : pending_sync_operations) {
+                if (ptr != nullptr) {
+                    cudaFree(ptr);
+                }
+            }
+            pending_sync_operations.clear();
+        }
     }
 
     int64_t getUIdToEvict(std::unordered_set<int64_t> extra_freezed_uids) {
@@ -1367,6 +1422,12 @@ private:
                         host_kv_mgr->append_kvdata_v2(uid, offload_startpos[seq_idx], offload_lengths[seq_idx], input_ptr, gather_layer_stride);
                         this->_uid_to_offloaded_length[uid] = offload_startpos[seq_idx] + offload_lengths[seq_idx];
                         page_offset += offload_lengths[seq_idx] / this->num_tokens_per_page;
+                        {
+                            std::unique_lock<std::mutex> lock(queued_offload_lastpos_mutex_);
+                            if (offload_startpos[seq_idx] + offload_lengths[seq_idx] == queued_offload_lastpos[uid]) {
+                                queued_offload_lastpos.erase(uid);
+                            }
+                        }
                     }
                 }
 
@@ -1403,6 +1464,9 @@ public:
         std::unordered_map<int64_t, int32_t> _uid_to_paged_cache_length;
         std::unordered_map<int64_t, int32_t> _uid_to_offloaded_length;
 
+    std::vector<void*> pending_sync_operations;
+    std::mutex pending_sync_mutex_;
+    
     int num_onload_memcpy_worker;
     std::vector<std::thread> onload_memcpy_worker;
     std::vector<uint16_t*> onload_pinned_buffers;
@@ -1423,6 +1487,8 @@ public:
     std::queue<std::tuple<std::vector<int>, at::Tensor, at::Tensor, cudaEvent_t>> offload_task_queue;
     std::mutex offload_task_mutex_;
     std::condition_variable offload_task_cv_;
+    std::unordered_map<int64_t, int> queued_offload_lastpos;
+    std::mutex queued_offload_lastpos_mutex_;
 
     int num_offload_memcpy_worker;
     std::vector<std::thread> offload_memcpy_worker;
@@ -1523,28 +1589,26 @@ void prepare_kvcache(
         last_page_len[seq_idx] = gpu_cache_length % gpu_mgr.num_tokens_per_page;
         onload_page_offset += num_onload_pages;
 
-            total_history_lengths[seq_idx] = total_history_length;
-            total_history_offsets[seq_idx + 1] = total_history_offsets[seq_idx] + total_history_length;
-            new_history_offsets[seq_idx + 1] = new_history_offsets[seq_idx] + total_history_length - old_history_lengths[seq_idx];
-            
-            // // 直接用 page_ids，顺序已保证
-            // page_indices.insert(page_indices.end(), page_ids.begin(), page_ids.end());
-            // page_indptr[seq_idx + 1] = page_indptr[seq_idx] + page_ids.size();
-            // last_page_len[seq_idx] = gpu_cache_length % gpu_mgr.num_tokens_per_page;
-            // total_history_lengths[seq_idx] = total_history_length;
-            // total_history_offsets[seq_idx + 1] = total_history_offsets[seq_idx] + total_history_length;
-            // new_history_offsets[seq_idx + 1] = new_history_offsets[seq_idx] + total_history_length - old_history_lengths[seq_idx];
-            
+        total_history_lengths[seq_idx] = total_history_length;
+        total_history_offsets[seq_idx + 1] = total_history_offsets[seq_idx] + total_history_length;
+        new_history_offsets[seq_idx + 1] = new_history_offsets[seq_idx] + total_history_length - old_history_lengths[seq_idx];
 
-            auto offloaded_length = 0;
-            if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
-                offloaded_length = gpu_mgr._uid_to_offloaded_length[uid];
+        auto offloaded_length = 0;
+        auto chunked_length = total_history_length - total_history_length % gpu_mgr.num_tokens_per_chunk;
+        if (gpu_mgr._uid_to_offloaded_length.find(uid) != gpu_mgr._uid_to_offloaded_length.end())
+            offloaded_length = gpu_mgr._uid_to_offloaded_length[uid];
+        {
+            std::unique_lock<std::mutex> lock(gpu_mgr.queued_offload_lastpos_mutex_);
+            if (gpu_mgr.queued_offload_lastpos.find(uid) != gpu_mgr.queued_offload_lastpos.end()) {
+                offloaded_length = gpu_mgr.queued_offload_lastpos[uid];
+            }
             if (total_history_length - offloaded_length >= gpu_mgr.num_tokens_per_chunk) {
-                auto chunked_length = total_history_length - total_history_length % gpu_mgr.num_tokens_per_chunk;
-                auto new_offload_page_start = (offloaded_length - gpu_cache_startpos) / gpu_mgr.num_tokens_per_page;
-                // std::cout << "[DEBUG] User " << uid << " offload: offloaded_length=" << offloaded_length
-                //       << " chunked_length=" << chunked_length
-                //       << " new_offload_page_start=" << new_offload_page_start << std::endl;
+                gpu_mgr.queued_offload_lastpos[uid] = chunked_length;
+            }
+        }
+        if (total_history_length - offloaded_length >= gpu_mgr.num_tokens_per_chunk) {
+            // auto chunked_length = total_history_length - total_history_length % gpu_mgr.num_tokens_per_chunk;
+            auto new_offload_page_start = (offloaded_length - gpu_cache_startpos) / gpu_mgr.num_tokens_per_page;
 
                 offload_user_ids[num_offload_uids] = uid;
                 new_offload_startpos[num_offload_uids] = offloaded_length;
@@ -1887,13 +1951,12 @@ void prepare_kvcache(
         std::vector<int64_t>& user_ids
     )
     {
-        std::cout << "sync_onload_buffer_v2_to_cache start" << std::endl << std::flush;
+        // std::cout << "sync_onload_buffer_v2_to_cache start" << std::endl << std::flush;
         int batch_size = user_ids.size();
         std::unordered_set<int64_t> freezed_uids(user_ids.begin(), user_ids.end());
         std::vector<size_t> onload_lengths(batch_size);
         std::vector<size_t> onload_offsets(batch_size + 1, 0);
 
-        // 计算每个用户的onload长度
         for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
             int64_t uid = user_ids[seq_idx];
             if (gpu_mgr._uid_to_paged_cache_startpos.find(uid) != gpu_mgr._uid_to_paged_cache_startpos.end())
@@ -1907,7 +1970,7 @@ void prepare_kvcache(
         size_t total_onload_length = onload_offsets[batch_size];
         if (total_onload_length == 0) return;
 
-        // 分配页面（只在第0层分配，所有层共享）
+        std::vector<int32_t> global_target_pages;
         for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
             int64_t uid = user_ids[seq_idx];
             size_t len = onload_lengths[seq_idx];
@@ -1917,12 +1980,12 @@ void prepare_kvcache(
             
             std::vector<int32_t> new_page_ids;
             while ((size_t)num_pages > gpu_mgr._empty_pages.size()) {
-                std::cout << "[DEBUG] evict start" << std::endl;
                 int64_t uid_to_evict = gpu_mgr.getUIdToEvict(freezed_uids);
                 gpu_mgr.evict(uid_to_evict);
             }
             for (int i = 0; i < num_pages; ++i) {
                 new_page_ids.push_back(gpu_mgr._empty_pages.front());
+                global_target_pages.push_back(gpu_mgr._empty_pages.front());
                 gpu_mgr._empty_pages.pop();
             }
 
@@ -1931,72 +1994,38 @@ void prepare_kvcache(
             gpu_mgr._uid_to_paged_cache_length[uid] += len;
         }
 
-        std::vector<int32_t> global_target_pages;
-        
-        for (int seq_idx = 0; seq_idx < batch_size; ++seq_idx) {
-            int64_t uid = user_ids[seq_idx];
-            size_t len = onload_lengths[seq_idx];
-            if (len == 0) continue;
-            
-            int num_pages = len / gpu_mgr.num_tokens_per_page;
-            const auto& user_pages = gpu_mgr._uid_to_page_id[uid];
-            
-            for (int page_i = 0; page_i < num_pages; ++page_i) {
-                global_target_pages.push_back(user_pages[page_i]);
-            }
-        }
-        
-        // 目标页面连续性
-        std::vector<std::tuple<int32_t, size_t, size_t>> continuous_segments;
-        size_t src_offset = 0;
-        
-        for (size_t i = 0; i < global_target_pages.size(); ) {
-            int32_t start_page = global_target_pages[i];
-            size_t segment_len = 1;
-            
-            //
-            while (i + segment_len < global_target_pages.size()) {
-                if (global_target_pages[i + segment_len] == global_target_pages[i + segment_len - 1] + 1) {
-                    segment_len++;
-                } else {
-                    break;
-                }
-            }
-            
-            continuous_segments.emplace_back(start_page, src_offset, segment_len);
-            // if (segment_len > 1) {
-            //     std::cout << "[CONTINUOUS_SEGMENT] Pages " << start_page 
-            //             << "-" << (start_page + segment_len - 1)
-            //             << " (" << segment_len << " pages)" << std::endl;
-            // }
-            
-            src_offset += segment_len * gpu_mgr.page_stride;
-            i += segment_len;
-        }
+        int32_t* target_page_ids_gpu;
+        cudaMalloc(reinterpret_cast<void**>(&target_page_ids_gpu), global_target_pages.size() * sizeof(int32_t));
+        cudaMemcpyAsync(target_page_ids_gpu, global_target_pages.data(), 
+                    global_target_pages.size() * sizeof(int32_t), 
+                    cudaMemcpyHostToDevice, gpu_mgr.sync_stream);
 
-        for (int layer_idx = 0; layer_idx < gpu_mgr.num_layers; ++layer_idx) {
-            uint16_t* gpu_onload_buffer = gpu_mgr.get_cache_table_by_layer(layer_idx) + 
+        uint16_t* gpu_onload_buffer = gpu_mgr.get_cache_table_by_layer(0) + 
                                     gpu_mgr.num_primary_cache_pages * gpu_mgr.page_stride;
-            
-            for (const auto& [start_page_id, src_offset, num_pages] : continuous_segments) {
-                uint16_t* src = gpu_onload_buffer + src_offset / sizeof(uint16_t);
-                uint16_t* dst = gpu_mgr.get_cache_table_by_layer(layer_idx) + 
-                            start_page_id * gpu_mgr.page_stride / sizeof(uint16_t);
-                
-                if (num_pages > 1) {
-                    size_t total_bytes = num_pages * gpu_mgr.page_stride * sizeof(uint16_t);
-                    cudaMemcpyAsync(dst, src, total_bytes, cudaMemcpyDeviceToDevice, gpu_mgr.sync_stream);
-                    std::cout << "[BATCH_COPY] Layer " << layer_idx 
-                            << ": " << num_pages << " pages (" << start_page_id 
-                            << "-" << (start_page_id + num_pages - 1) << ")" << std::endl;
-                } else {
-                    cudaMemcpyAsync(dst, src, gpu_mgr.page_stride * sizeof(uint16_t), cudaMemcpyDeviceToDevice, gpu_mgr.sync_stream);
-                }
-            }
-        }
         
-        std::cout << "sync_onload_buffer_to_cache end" << std::endl << std::flush;
+        scatter_paged_kv_cache_all_layers(
+            gpu_onload_buffer,                           // 连续源（起始位置）
+            gpu_mgr.get_cache_table(),                     // 离散目标（完整缓存表）
+            static_cast<int*>(target_page_ids_gpu),          // 页面ID映射
+            gpu_mgr.num_layers,                          // 多层，与offload一致
+            total_onload_length * gpu_mgr.per_token_kv_stride / sizeof(uint16_t), // 连续stride
+            gpu_mgr.layer_stride,                          // 目标stride
+            gpu_mgr.num_kv_heads,
+            gpu_mgr.kv_headdim,
+            gpu_mgr.num_tokens_per_page,
+            gpu_mgr.page_stride,
+            gpu_mgr.k2v_stride,
+            gpu_mgr.per_token_kv_stride,
+            gpu_mgr.kv_headdim,
+            global_target_pages.size(),
+            gpu_mgr.sync_stream);
+        
         // cudaStreamSynchronize(gpu_mgr.sync_stream);
+        // cudaFree(target_page_ids_gpu);
+        {
+            std::unique_lock<std::mutex> lock(gpu_mgr.pending_sync_mutex_);
+            gpu_mgr.pending_sync_operations.push_back(target_page_ids_gpu);
+        }
     }
     
     void synchronize_sync_stream(
@@ -2004,6 +2033,15 @@ void prepare_kvcache(
     ) 
     {
         cudaStreamSynchronize(gpu_mgr.sync_stream);
+        {
+            std::unique_lock<std::mutex> lock(gpu_mgr.pending_sync_mutex_);
+            for (void* ptr : gpu_mgr.pending_sync_operations) {
+                if (ptr != nullptr) {
+                    cudaFree(ptr);
+                }
+            }
+            gpu_mgr.pending_sync_operations.clear();
+        }
     };
 
 }

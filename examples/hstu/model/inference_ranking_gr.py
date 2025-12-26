@@ -714,7 +714,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.synchronize()
                 timing_info['prepare_kvcache_async'] = time.time() - prepare_kvcache_start
 
-            print("complete prepare kvcache")
+            # print("complete prepare kvcache")
             # 2. 去除已缓存的token
             if self.enable_timing_stats:
                 strip_cached_start = time.time()
@@ -748,7 +748,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.synchronize()
                 timing_info['preprocessing'] = time.time() - preprocess_start
 
-            print("complete preprocessing")
+            # print("complete preprocessing")
             # 5. 等待KV Cache准备完成
             if self.enable_timing_stats:
                 prepare_kvcache_wait_start = time.time()
@@ -769,7 +769,7 @@ class InferenceRankingGR(torch.nn.Module):
                 torch.cuda.synchronize()
                 timing_info['prepare_kvcache_wait'] = time.time() - prepare_kvcache_wait_start
 
-            print("complete prepare_kvcache_wait")
+            # print("complete prepare_kvcache_wait")
             # print("[DEBUG] kv_indices", kvcache_metadata.kv_indices)
             # print("[DEBUG] kv_indptr", kvcache_metadata.kv_indptr)
             # print("[DEBUG] kv_last_page_len", kvcache_metadata.kv_last_page_len)
@@ -794,7 +794,7 @@ class InferenceRankingGR(torch.nn.Module):
             # print("[DEBUG] new_history_nnz", kvcache_metadata.new_history_nnz)
             # print("[DEBUG] new_history_nnz_cuda", kvcache_metadata.new_history_nnz_cuda)
 
-            print("kvcache_metadata.offload_user_ids", kvcache_metadata.offload_user_ids)
+            # print("kvcache_metadata.offload_user_ids", kvcache_metadata.offload_user_ids)
             # print("kvcache_metadata.offload_page_ids", kvcache_metadata.offload_page_ids.shape)
 
             # 6. 更新KV Cache元数据
@@ -825,7 +825,7 @@ class InferenceRankingGR(torch.nn.Module):
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
                 timing_info['hstu_inference'] = time.time() - hstu_start
-            print("complete hstu inference")
+            # print("complete hstu inference")
             
             # 8. 下沉KV Cache
             if self.enable_timing_stats:
@@ -847,7 +847,7 @@ class InferenceRankingGR(torch.nn.Module):
                 jagged_item_logit = self._mlp(jagged_data.values)
                 self.async_kvcache.synchronize_sync_stream()
                 
-            print("complete postprocess_and_mlp")
+            # print("complete postprocess_and_mlp")
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
                 timing_info['postprocess_and_mlp'] = time.time() - postprocess_start
