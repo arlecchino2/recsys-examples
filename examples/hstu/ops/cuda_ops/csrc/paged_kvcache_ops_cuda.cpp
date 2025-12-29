@@ -1424,6 +1424,7 @@ void prepare_kvcache(
         std::vector<int64_t>& user_ids
     )
     {
+        const c10::cuda::OptionalCUDAGuard device_guard(gpu_mgr.device);
         // std::cout << "sync_onload_buffer_v2_to_cache start" << std::endl << std::flush;
         int batch_size = user_ids.size();
         std::unordered_set<int64_t> freezed_uids(user_ids.begin(), user_ids.end());
