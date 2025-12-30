@@ -378,7 +378,7 @@ class InferenceRankingGR(torch.nn.Module):
         model_state_dict_path = os.path.join(
             checkpoint_dir, "torch_module", "model.0.pth"
         )
-        model_state_dict = torch.load(model_state_dict_path)["model_state_dict"]
+        model_state_dict = torch.load(model_state_dict_path, map_location="cpu")["model_state_dict"]
         self.load_state_dict(model_state_dict, strict=False)
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
@@ -925,3 +925,53 @@ class InferenceRankingGR(torch.nn.Module):
 
         return jagged_item_logit
 
+    def print_hstu_decomposition_stats(self):
+        self.logger.info("\n" + "="*80)
+        self.logger.info(" PagedHSTUInferLayer Performance Stats ".center(80, "="))
+        self.logger.info("="*80)
+
+        if not hasattr(self, '_hstu_block') or not hasattr(self._hstu_block, '_attention_layers'):
+            self.logger.info("HSTU block layers not found. Cannot print performance stats.")
+            return
+
+        all_layer_stats = []
+        model_total_wait_time = 0.0
+        model_total_computation_time = 0.0
+
+        for i, layer in enumerate(self._hstu_block._attention_layers):
+            stats = layer.get_timing_stats()
+            
+            model_total_wait_time += stats['total_wait_time']
+            model_total_computation_time += stats['attention_computation_time']
+            
+            all_layer_stats.append({
+                "layer_idx": i,
+                **stats
+            })
+
+        header = f"{'Layer':<6} | {'Total Calls':<12} | {'Avg Wait (ms)':<14} | {'Avg Comp (ms)':<15} | {'Total Wait (ms)':<16} | {'Total Comp (ms)':<17}"
+        self.logger.info(header)
+        self.logger.info("-" * len(header))
+
+        for stat in all_layer_stats:
+            self.logger.info(
+                f"{stat['layer_idx']:<6} | "
+                f"{stat['total_forward_calls']:<12} | "
+                f"{stat['avg_wait_time_ms']:<14.4f} | "
+                f"{stat['avg_computation_time_ms']:<15.4f} | "
+                f"{stat['total_wait_time']:<16.4f} | "
+                f"{stat['attention_computation_time']:<17.4f}"
+            )
+        
+        self.logger.info("-" * len(header))
+
+        total_calls = sum(s['total_forward_calls'] for s in all_layer_stats)
+        self.logger.info(
+            f"{'Total':<6} | "
+            f"{total_calls:<12} | "
+            f"{'-':<14} | "
+            f"{'-':<15} | "
+            f"{model_total_wait_time:<16.4f} | "
+            f"{model_total_computation_time:<17.4f}"
+        )
+        self.logger.info("="*80 + "\n")

@@ -24,6 +24,7 @@ from ops.triton_ops.triton_layer_norm import triton_weighted_layer_norm_fwd
 from ops.triton_ops.triton_norm_mul_dropout import triton_layer_norm_mul_dropout_fwd
 
 import numpy as np
+import time
 
 def init():
     global dmp
@@ -160,6 +161,12 @@ class PagedHSTUInferLayer(torch.nn.Module):
             self.addmm_silu_impl = torch_addmm_silu_fwd
         else:
             raise ValueError(f"Unsupported SM major version: {sm}")
+        
+        self.timing_stats = {
+            'total_wait_time': 0.0,
+            'attention_computation_time': 0.0,
+            'total_forward_calls': 0,
+        }
 
     def uvqk_addmm_impl(self, input_data, num_tokens):
         if num_tokens >= 2048:  # fusion impl
@@ -256,6 +263,16 @@ class PagedHSTUInferLayer(torch.nn.Module):
     ):
         pass
 
+    def get_timing_stats(self):
+        stats = self.timing_stats.copy()
+        if stats['total_forward_calls'] > 0:
+            stats['avg_wait_time_ms'] = stats['total_wait_time'] / stats['total_forward_calls']
+            stats['avg_computation_time_ms'] = stats['attention_computation_time'] / stats['total_forward_calls']
+        else:
+            stats['avg_wait_time_ms'] = 0.0
+            stats['avg_computation_time_ms'] = 0.0
+        return stats
+
     @torch.inference_mode()
     def forward_naive(
         self,
@@ -285,6 +302,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
         query = query.view(-1, self._num_heads, self._attention_dim_per_head)
         key = key.view(-1, self._num_heads, self._attention_dim_per_head)
 
+        wait_start_time = time.perf_counter()
         if kv_cache_metadata is not None:
             kv_cache_table = kv_cache_metadata.kv_cache_table[self.layer_idx]
             (paged_k_cache, paged_v_cache) = kv_cache_table.unbind(dim=1)
@@ -305,6 +323,14 @@ class PagedHSTUInferLayer(torch.nn.Module):
             )
 
             kv_cache_metadata.kv_onload_handle.wait_host(self.layer_idx)
+            wait_end_time = time.perf_counter()
+            current_wait_ms = (wait_end_time - wait_start_time) * 1000
+            self.timing_stats['total_wait_time'] += current_wait_ms
+
+            attention_start_event = torch.cuda.Event(enable_timing=True)
+            attention_end_event = torch.cuda.Event(enable_timing=True)            
+            attention_start_event.record()
+            
             jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
                 query,
                 key,
@@ -327,6 +353,14 @@ class PagedHSTUInferLayer(torch.nn.Module):
                 cu_seqlens_t=jd.num_candidates_offsets[: batch_size + 1],
                 scaling_seqlen=jd.scaling_seqlen,
             )
+            
+            attention_end_event.record()
+            torch.cuda.synchronize()
+            current_computation_ms = attention_start_event.elapsed_time(attention_end_event)
+            self.timing_stats['attention_computation_time'] += current_computation_ms
+
+            self.timing_stats['total_forward_calls'] += 1
+
         else:
             jagged_attn_output = hstu_attn.hstu_attn_varlen_func(
                 query,

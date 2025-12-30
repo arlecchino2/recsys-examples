@@ -139,7 +139,7 @@ class InferenceDataset(IterableDataset[Batch]):
         # self._batch_logs_frame = self._batch_logs_frame[
         #     (self._batch_logs_frame["interval_end_ts"] < 1649433600000) & 
         #     # (self._batch_logs_frame["interval_indptr"] >= 1000) & 
-        #     (self._batch_logs_frame["interval_indptr"] <= 20000)
+        #     (self._batch_logs_frame["interval_indptr"] <= 10000)
         # ]
 
         self._batch_logs_frame = self._batch_logs_frame[ 
