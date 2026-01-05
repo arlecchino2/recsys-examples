@@ -303,10 +303,10 @@ class InferenceRankingGR(torch.nn.Module):
             self.cache_stats['total_sequence_length'] += batch_total_length
             self.cache_stats['batch_count'] += 1
         
-        # 记录每个batch的缓存分布
-        self.logger.info(f"Host Load: {batch_host_load_length}, "
-                        f"GPU Cache: {batch_gpu_length}, "
-                        f"New Tokens: {batch_new_tokens}",)
+        # # 记录每个batch的缓存分布
+        # self.logger.info(f"Host Load: {batch_host_load_length}, "
+        #                 f"GPU Cache: {batch_gpu_length}, "
+        #                 f"New Tokens: {batch_new_tokens}",)
 
     def print_cache_summary(self):
         if self.cache_stats['batch_count'] == 0:
