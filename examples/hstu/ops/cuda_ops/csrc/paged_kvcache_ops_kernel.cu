@@ -482,8 +482,8 @@ __global__ void ScatterPagedKVCacheAllLayersKernel(DType* continuous_kv_buffer,
       divmod(i, page_size, m, s, a, page_id_idx, entry_idx);
       
       size_t inner_page_offset = head_idx * stride_h + entry_idx * stride_n + tx * vec_size;
-      size_t src_offset = page_id_idx * stride_page + inner_page_offset;      // 连续源第N页
-      size_t dst_offset = __ldg(target_page_ids + page_id_idx) * stride_page + inner_page_offset;  // 🔥 离散目标通过ID映射
+      size_t src_offset = page_id_idx * stride_page + inner_page_offset;
+      size_t dst_offset = __ldg(target_page_ids + page_id_idx) * stride_page + inner_page_offset;
       
       vec_t<DType, vec_size>::memcpy(
           target_k_cache + dst_offset, continuous_k + src_offset);
