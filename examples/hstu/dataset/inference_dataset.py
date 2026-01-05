@@ -141,9 +141,14 @@ class InferenceDataset(IterableDataset[Batch]):
         #     (self._batch_logs_frame["interval_indptr"] <= 20000)
         # ]
 
+        # # 前两周 长度2w内
+        # self._batch_logs_frame = self._batch_logs_frame[
+        #     (self._batch_logs_frame["interval_end_ts"] < 1650816000000) & 
+        #     (self._batch_logs_frame["interval_indptr"] <= 20000)
+        # ]
+
         # 前两周 长度2w内
         self._batch_logs_frame = self._batch_logs_frame[
-            (self._batch_logs_frame["interval_end_ts"] < 1650816000000) & 
             (self._batch_logs_frame["interval_indptr"] <= 20000)
         ]
     

@@ -370,6 +370,9 @@ def run_ranking_gr_simulate(
                     prof.step()
                     if num_batches_ctr % 1000 == 0:
                         logger.info(f"num_batches_ctr: {num_batches_ctr}, uids: {uids.tolist()}, endptrs: {seq_endptrs.tolist()}")
+                        if num_batches_ctr % 10000 == 0:
+                            model.print_cache_summary()
+                            model._print_timing_summary()
                     
                     # if num_batches_ctr == 1000:
                     # if num_batches_ctr * max_batch_size >= 140000:
