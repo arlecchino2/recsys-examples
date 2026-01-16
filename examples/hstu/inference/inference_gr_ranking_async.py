@@ -52,8 +52,8 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_13_05"
-# log_dir = "./logs_without_kv/logs_12_29"
+log_dir = "./logs/logs_13_16"
+# log_dir = "./logs_without_kv/logs_13_06"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -193,7 +193,7 @@ def get_inference_hstu_model(
         # "blocks_in_primary_pool": 10240,
         "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,
-        "offload_chunksize": 1024, 
+        "offload_chunksize": 2048, 
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
