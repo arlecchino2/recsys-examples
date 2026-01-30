@@ -52,8 +52,8 @@ import torch.cuda.nvtx as nvtx
 sys.path.append("./model/")
 from inference_ranking_gr import InferenceRankingGR
 
-log_dir = "./logs/logs_13_16"
-# log_dir = "./logs_without_kv/logs_13_06"
+log_dir = "./logs/logs_13_29"
+# log_dir = "./logs_without_kv/logs_13_28"
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = f"{log_dir}/inference_benchmark_{current_time}.log"
 if not os.path.exists(log_dir):
@@ -83,12 +83,77 @@ def get_inference_dataset_and_embedding_configs(
     dataset_args = DatasetArgs()
     embedding_dim = NetworkArgs().hidden_size
     HASH_SIZE = 10_000_000
-    if dataset_args.dataset_name == "kuairand-1k":
+    if dataset_args.dataset_name in ["kuairand-1k", "kuairand-27k"]:
         embedding_configs = [
             InferenceEmbeddingConfig(
                 feature_names=["user_id"],
                 table_name="user_id",
-                vocab_size=1000,
+                vocab_size=10_000,
+                dim=embedding_dim,
+                use_dynamicemb=True,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["user_active_degree"],
+                table_name="user_active_degree",
+                vocab_size=8,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["follow_user_num_range"],
+                table_name="follow_user_num_range",
+                vocab_size=9,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["fans_user_num_range"],
+                table_name="fans_user_num_range",
+                vocab_size=9,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["friend_user_num_range"],
+                table_name="friend_user_num_range",
+                vocab_size=8,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["register_days_range"],
+                table_name="register_days_range",
+                vocab_size=8,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["video_id"],
+                table_name="video_id",
+                vocab_size=HASH_SIZE,
+                dim=embedding_dim,
+                use_dynamicemb=True,
+            ),
+            InferenceEmbeddingConfig(
+                feature_names=["action_weights"],
+                table_name="action_weights",
+                vocab_size=233,
+                dim=embedding_dim,
+                use_dynamicemb=False,
+            ),
+        ]
+        return (
+            dataset_args,
+            embedding_configs
+            if not disable_contextual_features
+            else embedding_configs[-2:],
+        )
+    elif dataset_args.dataset_name == 'meituan-32k':
+        embedding_configs = [
+            InferenceEmbeddingConfig(
+                feature_names=["user_id"],
+                table_name="user_id",
+                vocab_size=15000,
                 dim=embedding_dim,
                 use_dynamicemb=True,
             ),
@@ -193,7 +258,7 @@ def get_inference_hstu_model(
         # "blocks_in_primary_pool": 10240,
         "blocks_in_primary_pool": blocks_in_primary_pool,
         "page_size": 32,
-        "offload_chunksize": 2048, 
+        "offload_chunksize": 1024, 
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
@@ -215,6 +280,7 @@ def get_inference_hstu_model(
         "length_per_sequence": [128] + [i * 256 for i in range(1, 34)],
     }
 
+    logger.info(f"model.num_layers: {hstu_config.num_layers}")
     model = InferenceRankingGR(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config,
@@ -228,7 +294,7 @@ def get_inference_hstu_model(
         model.bfloat16()
     elif hstu_config.fp16:
         model.half()
-    model.load_checkpoint(checkpoint_dir)
+    # model.load_checkpoint(checkpoint_dir)
     model.eval()
 
     return model
@@ -325,7 +391,7 @@ def run_ranking_gr_simulate(
                     #    torch.cuda.memory._dump_snapshot(f"hstu_model.pickle")
                     #    torch.cuda.memory._record_memory_history(enabled=None)
                     #    break
-                    if num_batches_ctr == 1000:
+                    if num_batches_ctr == 3000:
                         start_time = time.time()
                     uids, dates, seq_endptrs = next(dataloader_iter)
                     print(f"{num_batches_ctr}, uids: {uids.tolist()}")
@@ -372,7 +438,7 @@ def run_ranking_gr_simulate(
 
                     prof.step()
 
-                    if num_batches_ctr % 10000 == 0:
+                    if num_batches_ctr % 2000 == 0 and num_batches_ctr > 3000:
                         # model.print_cache_summary()
                         # if enable_timing_stats:
                         model.print_cache_summary()

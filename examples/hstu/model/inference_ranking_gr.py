@@ -299,7 +299,7 @@ class InferenceRankingGR(torch.nn.Module):
         batch_new_tokens = sum(cache_distribution['new_tokens'])
         batch_total_length = sum(cache_distribution['total_lengths'])
         
-        if self.count > 999:
+        if self.count > 2999:
             self.cache_stats['total_gpu_length'] += batch_gpu_length
             self.cache_stats['total_host_load_length'] += batch_host_load_length
             self.cache_stats['total_new_tokens'] += batch_new_tokens
@@ -851,7 +851,7 @@ class InferenceRankingGR(torch.nn.Module):
                 timing_info['total_time'] = time.time() - start_time
 
                 self.count += 1
-                if self.count > 1000:
+                if self.count > 3000:
                     self._update_timing_stats('forward_with_cache', timing_info)
                     
                     # self.logger.info(f"====== Forward WITH KV Cache (Call #{self.timing_stats['forward_with_cache']['count']}) ======")
@@ -916,7 +916,7 @@ class InferenceRankingGR(torch.nn.Module):
                 timing_info['total_time'] = time.time() - start_time
 
                 self.count += 1
-                if self.count > 1000:
+                if self.count > 3000:
                     self._update_timing_stats('forward_no_cache', timing_info)
                     
                     # self.logger.info(f"====== Forward WITHOUT KV Cache (Call #{self.timing_stats['forward_no_cache']['count']}) ======")

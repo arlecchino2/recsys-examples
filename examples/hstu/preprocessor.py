@@ -755,12 +755,279 @@ class DLRMKuaiRandProcessor(DataProcessor):
         )
 
 
+class MeiTuanProcessor(DataProcessor):
+    """
+
+    Data processor for the `KuaiRand <https://kuairand.com/>`_ dataset.
+
+    Args:
+        download_url (str): URL from which to download the dataset.
+        data_path (str): Path where the dataset will be stored.
+        file_name (str): Name of the file containing the dataset.
+        prefix (str): The root directory of the dataset.
+    """
+
+    def __init__(
+        self,
+        # download_url: str,
+        data_path: str,
+        # file_name: str,
+        prefix: str,
+    ) -> None:
+        super().__init__('download_url', data_path, 'file_name', prefix)
+        self._item_feature_name = "video_id"
+        self._action_feature_name = "action_weights"
+        self._contextual_feature_names = [
+            "user_id",
+            "user_active_degree",
+            "follow_user_num_range",
+            "fans_user_num_range",
+            "friend_user_num_range",
+            "register_days_range",
+        ]
+        base_path = os.path.join(data_path, prefix, "data")
+
+        if prefix == "MeiTuan-32K":
+            self._log_files = [
+                os.path.join(base_path, "log_format_with_synthetic.csv"),
+            ]
+            self._user_features_file = os.path.join(base_path, "user_features_33k.csv")
+        
+        self._output_file: str = os.path.join(base_path, "processed_seqs.csv")
+        self._inference_sequence_file: str = os.path.join(
+            base_path, "processed_seqs_inference.csv"
+        )
+        self._inference_batch_file: str = os.path.join(
+            base_path, "processed_batches.csv"
+        )
+        self._event_merge_weight: Dict[str, int] = {
+            "is_click": 1,
+            "is_like": 2,
+            "is_follow": 4,
+            "is_comment": 8,
+            "is_forward": 16,
+            "is_hate": 32,
+            "long_view": 64,
+            "is_profile_enter": 128,
+        }
+
+    def _reorder_per_user_by_time(
+        self,
+        df_seq: pd.DataFrame,
+        seq_cols: List[str],
+        time_col: str = "time_ms",
+    ) -> pd.DataFrame:
+        """
+        Reorder each user's sequences by `time_col` (non-decreasing, stable),
+        and reorder all columns in `seq_cols` with the same permutation.
+
+        Notes:
+          - No type casting is performed; timestamps are used as-is.
+          - If a column in `seq_cols` has a different length than `time_col`, a ValueError is raised.
+          - If `time_col` is included in `seq_cols`, it will be reordered too; otherwise it is left as-is.
+        """
+
+        def _row_fn(row: pd.Series) -> pd.Series:
+            t = row[time_col]  # use original values as-is
+            order = np.argsort(
+                np.asarray(t), kind="mergesort"
+            )  # stable, non-decreasing
+            L = len(t)
+            for c in seq_cols:
+                seq = row[c]
+                if len(seq) != L:
+                    raise ValueError(
+                        f"length mismatch: user={row.get('user_id')} col={c} len={len(seq)} vs time={L}"
+                    )
+                row[c] = [seq[i] for i in order]
+            return row
+
+        return df_seq.apply(_row_fn, axis=1)
+
+    def preprocess_training(self) -> None:
+        """
+        Preprocess the raw data. The support dataset are "KuaiRand-Pure", "KuaiRand-1K", "KuaiRand-27K".
+        """
+        log.info("Preprocessing data...")
+        seq_cols = [
+            "video_id",
+            "time_ms",
+            "action_weights",
+            "play_time_ms",
+            "duration_ms",
+        ]
+        df = None
+        for idx, log_file in enumerate(self._log_files):
+            log.info(f"Processing {log_file}...")
+            log_df = pd.read_csv(
+                log_file,
+                delimiter=",",
+            )
+            df_grouped_by_user = log_df.groupby("user_id").agg(list).reset_index()
+
+            for event, weight in self._event_merge_weight.items():
+                df_grouped_by_user[event] = df_grouped_by_user[event].apply(
+                    lambda seq: np.where(np.array(seq) == 0, 0, weight)
+                )
+
+            events = list(self._event_merge_weight.keys())
+            df_grouped_by_user["action_weights"] = df_grouped_by_user.apply(
+                lambda row: [int(sum(x)) for x in zip(*[row[col] for col in events])],
+                axis=1,
+            )
+            df_grouped_by_user = df_grouped_by_user[["user_id"] + seq_cols]
+
+            if idx == 0:
+                df = df_grouped_by_user
+            else:
+                df = df.merge(df_grouped_by_user, on="user_id", suffixes=("_x", "_y"))  # type: ignore[union-attr]
+                for col in seq_cols:
+                    df[col] = df.apply(
+                        lambda row: row[col + "_x"] + row[col + "_y"], axis=1
+                    )
+                    df = df.drop(columns=[col + "_x", col + "_y"])
+
+        df = self._reorder_per_user_by_time(df, seq_cols)
+        log.info("Merging user features...")
+        user_features_df = pd.read_csv(self._user_features_file, delimiter=",")
+
+        contextual_feature_names = self._contextual_feature_names.copy()
+        contextual_feature_names.remove("user_id")
+        for col in contextual_feature_names:
+            user_features_df[col] = _one_hot_encode(user_features_df[col])
+
+        self._post_process(
+            user_features_df,
+            df,
+            "user_id",
+            contextual_feature_names=self._contextual_feature_names,
+            item_feature_name="video_id",
+            action_feature_name="action_weights",
+            output_file=self._output_file,
+        )
+
+    def preprocess_inference(self, **kwargs) -> None:
+        """
+        Preprocess the raw data. The support dataset are "KuaiRand-Pure", "KuaiRand-1K", "KuaiRand-27K".
+        """
+
+        log.info("Preprocessing data...")
+        seq_cols = [
+            "video_id",
+            "time_ms",
+            "action_weights",
+            "play_time_ms",
+            "duration_ms",
+        ]
+        # timestamp in KuaiRand dataset is in milliseconds
+        time_interval = kwargs["time_interval"] * 1000
+
+        def create_interval(group):
+            sorted_group = sorted(
+                zip(*(group[_col_name] for _col_name in seq_cols)),
+                key=lambda item: item[1],
+            )
+            interval_group = [0]
+            for idx in range(1, len(group["time_ms"])):
+                delta_time = sorted_group[idx][1] - sorted_group[interval_group[-1]][1]
+                if delta_time >= time_interval:
+                    interval_group.append(idx)
+            interval_group.append(len(group["time_ms"]))
+            return pd.Series(
+                [group.user_id, group.date]
+                + [list(l) for l in zip(*sorted_group)]
+                + [interval_group, len(interval_group) - 1],
+                index=["user_id", "date"]
+                + seq_cols
+                + ["interval_indptr", "num_intervals"],
+            )
+
+        def filter_interval(group):
+            idx = group.interval_indptr[int(group.interval_counter)]
+            return pd.Series(
+                [group.user_id, group.date, group["time_ms"][idx - 1], idx],
+                index=["user_id", "date", "interval_end_ts", "interval_indptr"],
+                dtype=np.int64,
+            )
+        
+        all_log_dfs = []
+
+        for idx, log_file in enumerate(self._log_files):
+            log.info(f"Processing {log_file}...")
+            log_df = pd.read_csv(
+                log_file,
+                delimiter=",",
+            )
+
+            # if idx == 1:
+            #     log_df = log_df[log_df['date'] >= 20220422]
+            
+            all_log_dfs.append(log_df)
+
+        df_combined = pd.concat(all_log_dfs, ignore_index=True)
+        # 筛选用户数量
+        df_combined = df_combined[df_combined['user_id'] <= 14905]
+        df_combined["date"] = 20260101
+        df_grouped_by_user = (
+            df_combined.groupby(["user_id", "date"]).agg(list).reset_index()
+        )
+
+        for event, weight in self._event_merge_weight.items():
+            df_grouped_by_user[event] = df_grouped_by_user[event].apply(
+                lambda seq: np.where(np.array(seq) == 0, 0, weight)
+            )
+
+        events = list(self._event_merge_weight.keys())
+        df_grouped_by_user["action_weights"] = df_grouped_by_user.apply(
+            lambda row: [int(sum(x)) for x in zip(*[row[col] for col in events])],
+            axis=1,
+        )
+        df_grouped_by_user = df_grouped_by_user[["user_id", "date"] + seq_cols]
+
+        df_sorted = df_grouped_by_user.apply(create_interval, axis=1)
+        df_filtered = df_sorted.groupby(level=0).apply(
+            lambda group: group.reset_index(drop=True)
+            .reindex(np.arange(np.int64(group.num_intervals)))
+            .fillna(method="ffill")
+        )
+        
+        df_filtered["interval_counter"] = df_filtered.index.get_level_values(1) + 1
+        df_filtered = df_filtered.apply(filter_interval, axis=1)
+        df_filtered.reset_index()
+
+        sequence_df = df_sorted
+        batching_df = df_filtered
+
+        log.info("Merging user features...")
+        user_features_df = pd.read_csv(self._user_features_file, delimiter=",")
+
+        contextual_feature_names = self._contextual_feature_names.copy()
+        contextual_feature_names.remove("user_id")
+        for col in contextual_feature_names:
+            user_features_df[col] = _one_hot_encode(user_features_df[col])
+
+        self._post_process_for_inference(
+            user_features_df,
+            sequence_df,
+            batching_df,
+            "user_id",
+            "date",
+            contextual_feature_names=self._contextual_feature_names + ["date"],
+            item_feature_name="video_id",
+            action_feature_name="action_weights",
+            sequence_file=self._inference_sequence_file,
+            batching_file=self._inference_batch_file,
+        )
+
+
+
 dataset_names = (
     "ml-1m",
     "ml-20m",
     "kuairand-pure",
     "kuairand-1k",
     "kuairand-27k",
+    "meituan-32k",
 )
 
 
@@ -804,6 +1071,12 @@ def get_common_preprocessors(dataset_path: str):
         file_name="KuaiRand-27K.tar.gz",
         prefix="KuaiRand-27K",
     )
+    meituan_32k_dp = MeiTuanProcessor(
+        # download_url="https://zenodo.org/records/10439422/files/KuaiRand-27K.tar.gz",
+        data_path=data_path,
+        # file_name="KuaiRand-27K.tar.gz",
+        prefix="MeiTuan-32K",
+    )
     preprocessors = {}
     for key in dataset_names:
         preprocessors[key] = locals()[f"{key}_dp".replace("-", "_")]
@@ -831,7 +1104,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_ts_interval",
         type=int,
-        default=60,
+        # default=60,
+        default=30,
         help="Batching time interval for inference data (seconds).",
     )
     args = parser.parse_args()

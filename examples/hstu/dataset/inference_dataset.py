@@ -112,46 +112,9 @@ class InferenceDataset(IterableDataset[Batch]):
                 batch_logs_file, delimiter=",", nrows=batch_nrows
             )
 
-        # date 20220425 对应的时间戳: 1650844800000
-        # 筛选条件：interval_end_ts > 1650844800000 且 interval_indptr > 1000
-        # self._batch_logs_frame = self._batch_logs_frame[
-        #     (self._batch_logs_frame["interval_end_ts"] > 1650844800000) &
-        #     (self._batch_logs_frame["interval_indptr"] >= 10000) &
-        #     (self._batch_logs_frame["interval_indptr"] <= 20000)
-        # ]
-        
-        # # 20220507 对应的时间戳是 1651881600000
-        # self._batch_logs_frame = self._batch_logs_frame[
-        #     (self._batch_logs_frame["interval_end_ts"] > 1651881600000) &
-        #     (self._batch_logs_frame["interval_indptr"] >= 2000) &
-        #     (self._batch_logs_frame["interval_indptr"] <= 10000)
-        # ]
-        
-        # date 20220425 对应的时间戳: 1650844800000
-        # 筛选条件：interval_end_ts > 1650844800000
-        # self._batch_logs_frame = self._batch_logs_frame[
-        #     (self._batch_logs_frame["interval_end_ts"] > 1650844800000) & 
-        #     (self._batch_logs_frame["interval_indptr"] <= 20000)
-        # ]
-
-        # # date 20220409 对应的时间戳: 1649433600000 第一天
-        # # 筛选条件：interval_end_ts < 1649433600000
-        # self._batch_logs_frame = self._batch_logs_frame[
-        #     (self._batch_logs_frame["interval_end_ts"] < 1649433600000) & 
-        #     # (self._batch_logs_frame["interval_indptr"] >= 1000) & 
-        #     (self._batch_logs_frame["interval_indptr"] <= 10000)
-        # ]
-
         self._batch_logs_frame = self._batch_logs_frame[ 
             self._batch_logs_frame["interval_indptr"] <= 20000
         ]
-
-        # # # 前两周 长度2k-2w内
-        # self._batch_logs_frame = self._batch_logs_frame[
-        #     (self._batch_logs_frame["interval_end_ts"] < 1650816000000) & 
-        #     (self._batch_logs_frame["interval_indptr"] > 2000) & 
-        #     (self._batch_logs_frame["interval_indptr"] <= 20000)
-        # ]
     
         self._batch_logs_frame.sort_values(by=timestamp_names, inplace=True)
         print(f'len of self._batch_logs_frame, {len(self._batch_logs_frame)}')
